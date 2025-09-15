@@ -1,5 +1,7 @@
 #!/bin/bash
 
+## Credit : Andrej Karpathy (https://github.com/karpathy)
+
 # Get the directory of the script
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
@@ -78,3 +80,4 @@ run_in_parallel() {
 run_in_parallel 6 "${download_commands[@]}"
 
 echo "All files downloaded and saved in their respective directories"
+
