@@ -1,15 +1,23 @@
 mod layers;
-mod model;
 mod loader;
+#[cfg(not(test))]
+mod model;
 
+#[cfg(not(test))]
 use model::Gpt2;
+#[cfg(not(test))]
 use loader::DataLoader;
-use std::time::{Instant};
-use std::path::{Path, PathBuf};
+#[cfg(not(test))]
 use std::fs;
+#[cfg(not(test))]
+use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::time::Instant;
 
+#[cfg(not(test))]
 const GPT2_EOT: i32 = 50256;
 
+#[cfg(not(test))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = Gpt2::build_from_checkpoint("gpt2_124M.bin")?;
 
@@ -150,4 +158,46 @@ fn sample_mult(probabilities: &[f32], n: usize, coin: f32) -> usize {
         }
     }
     n - 1
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn random_u32_matches_reference_implementation() {
+        let mut state = 123_456_789u64;
+        let mut reference_state = state;
+        reference_state ^= reference_state >> 12;
+        reference_state ^= reference_state << 25;
+        reference_state ^= reference_state >> 27;
+        let expected = ((reference_state.wrapping_mul(0x2545F4914F6CDD1D)) >> 32) as u32;
+
+        let value = super::random_u32(&mut state);
+        assert_eq!(value, expected);
+        assert_eq!(state, reference_state);
+    }
+
+    #[test]
+    fn random_f32_produces_value_in_unit_interval() {
+        let mut state = 987_654_321u64;
+        let mut reference_state = state;
+        reference_state ^= reference_state >> 12;
+        reference_state ^= reference_state << 25;
+        reference_state ^= reference_state >> 27;
+        let rand = ((reference_state.wrapping_mul(0x2545F4914F6CDD1D)) >> 32) as u32;
+        let expected = ((rand >> 8) as f32) / 16_777_216.0;
+
+        let value = super::random_f32(&mut state);
+        assert!(value >= 0.0 && value < 1.0);
+        assert!((value - expected).abs() < 1e-7);
+        assert_eq!(state, reference_state);
+    }
+
+    #[test]
+    fn sample_mult_selects_based_on_cumulative_probability() {
+        let probabilities = [0.1, 0.2, 0.7];
+        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.05), 0);
+        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.1), 1);
+        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.3), 2);
+        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.95), 2);
+    }
 }
