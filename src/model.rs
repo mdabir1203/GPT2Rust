@@ -364,7 +364,7 @@ impl<'a> Gpt2<'a> {
             crate::layers::residual_forward(l_residual2, residual, l_attproj, B*T*C);
             crate::layers::layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
             crate::layers::matmul_forward(l_fch, l_ln2, l_fcw, Some(l_fcb), B, T, C, 4*C);
-            crate::layers::gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+            crate::layers::gelu_forward(l_fch_gelu, l_fch);
             crate::layers::matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, Some(l_fcprojb), B, T, 4*C, C);
             crate::layers::residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
         }
@@ -486,7 +486,7 @@ impl<'a> Gpt2<'a> {
 
             crate::layers::residual_backward(dresidual_in, dl_fcproj, dresidual, B*T*C);
             crate::layers::matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-            crate::layers::gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
+            crate::layers::gelu_backward(dl_fch, l_fch, dl_fch_gelu);
             crate::layers::matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
             crate::layers::layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
             crate::layers::residual_backward(dresidual_in, dl_attproj, dl_residual2, B*T*C);

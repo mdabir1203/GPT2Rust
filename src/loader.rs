@@ -28,7 +28,7 @@ impl DataLoader {
             return Err("File too small".into());
         }
 
-        let mut batch = vec![0i32; B * T + 1];
+        let batch = vec![0i32; B * T + 1];
         let inputs = batch[0..B * T].to_vec();
         let targets = batch[1..B * T + 1].to_vec();
 
@@ -80,5 +80,85 @@ impl DataLoader {
 impl Drop for DataLoader {
     fn drop(&mut self) {
         // File is automatically closed when `tokens_file` is dropped.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{remove_file, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("{}_{}", name, nanos));
+        path
+    }
+
+    fn write_i32_file(path: &PathBuf, values: &[i32]) {
+        let mut file = File::create(path).unwrap();
+        for &v in values {
+            file.write_all(&v.to_le_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn dataloader_new_and_next_batch_reads_expected_sequences() {
+        let path = temp_file("tokens");
+        let values = [1, 2, 3, 4, 5, 6];
+        write_i32_file(&path, &values);
+
+        let B = 1;
+        let T = 2;
+        let mut loader = DataLoader::new(&path, B, T).unwrap();
+
+        assert_eq!(loader.batch.len(), B * T + 1);
+        assert_eq!(loader.inputs.len(), B * T);
+        assert_eq!(loader.targets.len(), B * T);
+        assert!(loader.num_batches >= 1);
+
+        loader.next_batch().unwrap();
+        assert_eq!(&loader.inputs, &[1, 2]);
+        assert_eq!(&loader.targets, &[2, 3]);
+
+        loader.next_batch().unwrap();
+        assert_eq!(&loader.inputs, &[3, 4]);
+        assert_eq!(&loader.targets, &[4, 5]);
+
+        drop(loader);
+        remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn dataloader_reset_resets_position() {
+        let path = temp_file("tokens_reset");
+        let values = [10, 11, 12, 13, 14, 15];
+        write_i32_file(&path, &values);
+
+        let B = 1;
+        let T = 2;
+        let mut loader = DataLoader::new(&path, B, T).unwrap();
+
+        loader.next_batch().unwrap();
+        assert_eq!(&loader.inputs, &[10, 11]);
+        assert!(loader.current_position > 0);
+
+        loader.next_batch().unwrap();
+        assert_ne!(&loader.inputs, &[10, 11]);
+
+        loader.reset();
+        assert_eq!(loader.current_position, 0);
+
+        loader.next_batch().unwrap();
+        assert_eq!(&loader.inputs, &[10, 11]);
+
+        drop(loader);
+        remove_file(&path).unwrap();
     }
 }
