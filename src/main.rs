@@ -5,31 +5,77 @@ mod loader;
 use model::Gpt2;
 use loader::DataLoader;
 use std::time::{Instant};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::fs;
 
 const GPT2_EOT: i32 = 50256;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = Gpt2::build_from_checkpoint("gpt2_124M.bin")?;
 
-    let train_tokens = if Path::new("data/tiny_shakespeare_train.bin").exists() {
-        "data/tiny_shakespeare_train.bin"
-    } else {
-        "data/TinyStories_train.bin"
-    };
-    let val_tokens = if Path::new("data/tiny_shakespeare_val.bin").exists() {
-        "data/tiny_shakespeare_val.bin"
-    } else {
-        "data/TinyStories_val.bin"
-    };
+    // --- START: Dynamic Dataset Discovery ---
+    let data_dir = Path::new("data");
+    if !data_dir.exists() {
+        return Err(format!("Data directory '{}' not found", data_dir.display()).into());
+    }
+
+    // Read all entries in the data directory
+    let entries = fs::read_dir(data_dir)?;
+
+    // Find all files ending with "_train.bin"
+    let mut datasets: Vec<(String, PathBuf, PathBuf)> = Vec::new(); // (name, train_path, val_path)
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() {
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if filename.ends_with("_train.bin") {
+                    // Extract the dataset name (remove "_train.bin")
+                    let dataset_name = filename.strip_suffix("_train.bin").unwrap_or(filename).to_string();
+
+                    // Construct expected validation file path
+                    let val_filename = format!("{}_val.bin", dataset_name);
+                    let val_path = data_dir.join(&val_filename);
+
+                    // Check if validation file exists
+                    if val_path.exists() {
+                        datasets.push((dataset_name, path, val_path));
+                    } else {
+                        eprintln!("Warning: Found train file '{}' but no corresponding validation file '{}'. Skipping.", path.display(), val_path.display());
+                    }
+                }
+            }
+        }
+    }
+
+    if datasets.is_empty() {
+        return Err("No valid datasets found. Expected files like 'dataset_name_train.bin' and 'dataset_name_val.bin' in the 'data/' directory.".into());
+    }
+
+    // Print available datasets
+    println!("Available datasets:");
+    for (i, (name, train_path, val_path)) in datasets.iter().enumerate() {
+        println!("  {}: {}", i + 1, name);
+        println!("    Train: {}", train_path.display());
+        println!("    Val:   {}", val_path.display());
+    }
+
+    // Choose the first dataset by default
+    // TODO: Extend this to accept a command-line argument for dataset selection
+    let chosen_idx = 0;
+    let (dataset_name, train_path, val_path) = &datasets[chosen_idx];
+    println!("\nUsing dataset: '{}'", dataset_name);
+    // --- END: Dynamic Dataset Discovery ---
 
     let B = 4;
     let T = 64;
 
-    let mut train_loader = DataLoader::new(train_tokens, B, T)?;
+    let mut train_loader = DataLoader::new(train_path, B, T)?;
     println!("train dataset num_batches: {}", train_loader.num_batches);
 
-    let mut val_loader = DataLoader::new(val_tokens, B, T)?;
+    let mut val_loader = DataLoader::new(val_path, B, T)?;
     println!("val dataset num_batches: {}", val_loader.num_batches);
     let val_num_batches = 10;
 
@@ -61,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let next_token = sample_mult(probs, model.config.vocab_size, coin) as i32;
                 gen_tokens[t] = next_token;
             }
-            print!("generated: ");
+            print!("step {} generated: ", step);
             for &token in &gen_tokens[..] {
                 print!("{} ", token);
             }
@@ -104,10 +150,4 @@ fn sample_mult(probabilities: &[f32], n: usize, coin: f32) -> usize {
         }
     }
     n - 1
-}
-
-    println!("Prompt   : {}", prompt);
-    println!("Generated: {}", generated);
-    println!("Steps    : {}", steps);
-    println!("Duration : {:.3} ms", elapsed_ms(start, end));
 }
