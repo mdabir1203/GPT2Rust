@@ -1,81 +1,84 @@
-//! Deterministic weight initialisation utilities.
-//!
-//! The original C implementation that inspired this project exposed a manual
-//! initialisation routine.  In Rust we model that behaviour through the
-//! [`WeightInitializer`] type which feeds pseudo random numbers into the model
-//! layers.  Keeping the generator extremely small makes it simple to understand
-//! the values that end up in the network which is perfect for experimentation
-//! and educational purposes.
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
-use crate::layers::{FeedForward, LayerNorm, Linear, MultiHeadAttention};
-
-pub struct WeightInitializer {
-    state: u64,
+pub struct DataLoader {
+    pub B: usize,
+    pub T: usize,
+    tokens_file: File,
+    file_size: u64,
+    current_position: u64,
+    pub batch: Vec<i32>,
+    pub inputs: Vec<i32>,
+    pub targets: Vec<i32>,
+    pub num_batches: usize,
 }
 
-impl WeightInitializer {
-    pub fn new(seed: u64) -> Self {
-        let state = if seed == 0 {
-            0x_4d595df4_d0f33173
-        } else {
-            seed
-        };
-        Self { state }
-    }
+impl DataLoader {
+    pub fn new<P: AsRef<Path>>(
+        filename: P,
+        B: usize,
+        T: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut tokens_file = File::open(filename)?;
+        let file_size = tokens_file.seek(SeekFrom::End(0))?;
+        tokens_file.seek(SeekFrom::Start(0))?;
 
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 7;
-        x ^= x >> 9;
-        x ^= x << 8;
-        self.state = x;
-        x
-    }
-
-    pub fn next_f32(&mut self) -> f32 {
-        let value = self.next_u64() as f64 / u64::MAX as f64;
-        (value * 2.0 - 1.0) as f32
-    }
-
-    pub fn vector(&mut self, len: usize, scale: f32) -> Vec<f32> {
-        let mut data = Vec::with_capacity(len);
-        for _ in 0..len {
-            data.push(self.next_f32() * scale);
+        if file_size < ((B * T + 1) * std::mem::size_of::<i32>()) as u64 {
+            return Err("File too small".into());
         }
-        data
+
+        let mut batch = vec![0i32; B * T + 1];
+        let inputs = batch[0..B * T].to_vec();
+        let targets = batch[1..B * T + 1].to_vec();
+
+        Ok(DataLoader {
+            B,
+            T,
+            tokens_file,
+            file_size,
+            current_position: 0,
+            batch,
+            inputs,
+            targets,
+            num_batches: (file_size as usize) / (B * T * std::mem::size_of::<i32>()),
+        })
     }
 
-    pub fn embeddings(&mut self, rows: usize, cols: usize) -> Vec<f32> {
-        self.vector(rows * cols, 0.02)
+    pub fn reset(&mut self) {
+        self.current_position = 0;
     }
 
-    pub fn linear(&mut self, in_features: usize, out_features: usize) -> Linear {
-        let scale = 1.0 / (in_features as f32).sqrt();
-        let weight = self.vector(in_features * out_features, scale);
-        let bias = vec![0.0; out_features];
-        Linear::new(in_features, out_features, weight, bias)
-    }
-
-    pub fn layer_norm(&mut self, hidden_size: usize) -> LayerNorm {
-        let mut gamma = vec![1.0; hidden_size];
-        for value in gamma.iter_mut() {
-            *value += self.next_f32() * 0.01;
+    pub fn next_batch(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.current_position + ((self.B * self.T + 1) * std::mem::size_of::<i32>()) as u64
+            > self.file_size
+        {
+            self.current_position = 0;
         }
-        let beta = vec![0.0; hidden_size];
-        LayerNorm::new(hidden_size, gamma, beta, 1e-5)
-    }
 
-    pub fn attention(&mut self, hidden_size: usize, n_heads: usize) -> MultiHeadAttention {
-        let w_q = self.linear(hidden_size, hidden_size);
-        let w_k = self.linear(hidden_size, hidden_size);
-        let w_v = self.linear(hidden_size, hidden_size);
-        let w_o = self.linear(hidden_size, hidden_size);
-        MultiHeadAttention::new(hidden_size, n_heads, w_q, w_k, w_v, w_o)
-    }
+        self.tokens_file
+            .seek(SeekFrom::Start(self.current_position))?;
+        let bytes_to_read = (self.B * self.T + 1) * std::mem::size_of::<i32>();
+        let mut buffer = vec![0u8; bytes_to_read];
+        self.tokens_file.read_exact(&mut buffer)?;
 
-    pub fn feed_forward(&mut self, hidden_size: usize, intermediate: usize) -> FeedForward {
-        let proj_in = self.linear(hidden_size, intermediate);
-        let proj_out = self.linear(intermediate, hidden_size);
-        FeedForward::new(proj_in, proj_out)
+        // Convert bytes to i32 (assuming little-endian)
+        for (i, chunk) in buffer.chunks_exact(std::mem::size_of::<i32>()).enumerate() {
+            self.batch[i] = i32::from_le_bytes(chunk.try_into().unwrap());
+        }
+
+        self.inputs.copy_from_slice(&self.batch[0..self.B * self.T]);
+        self.targets
+            .copy_from_slice(&self.batch[1..self.B * self.T + 1]);
+
+        self.current_position += (self.B * self.T * std::mem::size_of::<i32>()) as u64;
+
+        Ok(())
+    }
+}
+
+impl Drop for DataLoader {
+    fn drop(&mut self) {
+        // File is automatically closed when `tokens_file` is dropped.
     }
 }
