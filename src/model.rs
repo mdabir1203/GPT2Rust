@@ -64,6 +64,160 @@ pub struct ActivationTensors<'a> {
     pub losses: &'a mut [f32],
 }
 
+fn parameter_sizes(config: &Gpt2Config) -> [usize; NUM_PARAMETER_TENSORS] {
+    [
+        config.vocab_size * config.channels,  // wte
+        config.max_seq_len * config.channels, // wpe
+        config.num_layers * config.channels,  // ln1w
+        config.num_layers * config.channels,  // ln1b
+        config.num_layers * (3 * config.channels) * config.channels, // qkvw
+        config.num_layers * (3 * config.channels), // qkvb
+        config.num_layers * config.channels * config.channels, // attprojw
+        config.num_layers * config.channels,  // attprojb
+        config.num_layers * config.channels,  // ln2w
+        config.num_layers * config.channels,  // ln2b
+        config.num_layers * (4 * config.channels) * config.channels, // fcw
+        config.num_layers * (4 * config.channels), // fcb
+        config.num_layers * config.channels * (4 * config.channels), // fcprojw
+        config.num_layers * config.channels,  // fcprojb
+        config.channels,                      // lnfw
+        config.channels,                      // lnfb
+    ]
+}
+
+fn activation_sizes(config: &Gpt2Config, B: usize, T: usize) -> [usize; NUM_ACTIVATION_TENSORS] {
+    let C = config.channels;
+    let L = config.num_layers;
+    let NH = config.num_heads;
+    let V = config.vocab_size;
+
+    [
+        B * T * C,          // encoded
+        L * B * T * C,      // ln1
+        L * B * T,          // ln1_mean
+        L * B * T,          // ln1_rstd
+        L * B * T * 3 * C,  // qkv
+        L * B * T * C,      // atty
+        L * B * NH * T * T, // preatt
+        L * B * NH * T * T, // att
+        L * B * T * C,      // attproj
+        L * B * T * C,      // residual2
+        L * B * T * C,      // ln2
+        L * B * T,          // ln2_mean
+        L * B * T,          // ln2_rstd
+        L * B * T * 4 * C,  // fch
+        L * B * T * 4 * C,  // fch_gelu
+        L * B * T * C,      // fcproj
+        L * B * T * C,      // residual3
+        B * T * C,          // lnf
+        B * T,              // lnf_mean
+        B * T,              // lnf_rstd
+        B * T * V,          // logits
+        B * T * V,          // probs
+        B * T,              // losses
+    ]
+}
+
+fn split_parameter_tensors<'a>(
+    mut buffer: &'a mut [f32],
+    sizes: &[usize; NUM_PARAMETER_TENSORS],
+) -> ParameterTensors<'a> {
+    let (wte, rest) = buffer.split_at_mut(sizes[0]);
+    let (wpe, rest) = rest.split_at_mut(sizes[1]);
+    let (ln1w, rest) = rest.split_at_mut(sizes[2]);
+    let (ln1b, rest) = rest.split_at_mut(sizes[3]);
+    let (qkvw, rest) = rest.split_at_mut(sizes[4]);
+    let (qkvb, rest) = rest.split_at_mut(sizes[5]);
+    let (attprojw, rest) = rest.split_at_mut(sizes[6]);
+    let (attprojb, rest) = rest.split_at_mut(sizes[7]);
+    let (ln2w, rest) = rest.split_at_mut(sizes[8]);
+    let (ln2b, rest) = rest.split_at_mut(sizes[9]);
+    let (fcw, rest) = rest.split_at_mut(sizes[10]);
+    let (fcb, rest) = rest.split_at_mut(sizes[11]);
+    let (fcprojw, rest) = rest.split_at_mut(sizes[12]);
+    let (fcprojb, rest) = rest.split_at_mut(sizes[13]);
+    let (lnfw, rest) = rest.split_at_mut(sizes[14]);
+    let (lnfb, rest) = rest.split_at_mut(sizes[15]);
+
+    debug_assert!(rest.is_empty());
+
+    ParameterTensors {
+        wte,
+        wpe,
+        ln1w,
+        ln1b,
+        qkvw,
+        qkvb,
+        attprojw,
+        attprojb,
+        ln2w,
+        ln2b,
+        fcw,
+        fcb,
+        fcprojw,
+        fcprojb,
+        lnfw,
+        lnfb,
+    }
+}
+
+fn split_activation_tensors<'a>(
+    mut buffer: &'a mut [f32],
+    sizes: &[usize; NUM_ACTIVATION_TENSORS],
+) -> ActivationTensors<'a> {
+    let (encoded, rest) = buffer.split_at_mut(sizes[0]);
+    let (ln1, rest) = rest.split_at_mut(sizes[1]);
+    let (ln1_mean, rest) = rest.split_at_mut(sizes[2]);
+    let (ln1_rstd, rest) = rest.split_at_mut(sizes[3]);
+    let (qkv, rest) = rest.split_at_mut(sizes[4]);
+    let (atty, rest) = rest.split_at_mut(sizes[5]);
+    let (preatt, rest) = rest.split_at_mut(sizes[6]);
+    let (att, rest) = rest.split_at_mut(sizes[7]);
+    let (attproj, rest) = rest.split_at_mut(sizes[8]);
+    let (residual2, rest) = rest.split_at_mut(sizes[9]);
+    let (ln2, rest) = rest.split_at_mut(sizes[10]);
+    let (ln2_mean, rest) = rest.split_at_mut(sizes[11]);
+    let (ln2_rstd, rest) = rest.split_at_mut(sizes[12]);
+    let (fch, rest) = rest.split_at_mut(sizes[13]);
+    let (fch_gelu, rest) = rest.split_at_mut(sizes[14]);
+    let (fcproj, rest) = rest.split_at_mut(sizes[15]);
+    let (residual3, rest) = rest.split_at_mut(sizes[16]);
+    let (lnf, rest) = rest.split_at_mut(sizes[17]);
+    let (lnf_mean, rest) = rest.split_at_mut(sizes[18]);
+    let (lnf_rstd, rest) = rest.split_at_mut(sizes[19]);
+    let (logits, rest) = rest.split_at_mut(sizes[20]);
+    let (probs, rest) = rest.split_at_mut(sizes[21]);
+    let (losses, rest) = rest.split_at_mut(sizes[22]);
+
+    debug_assert!(rest.is_empty());
+
+    ActivationTensors {
+        encoded,
+        ln1,
+        ln1_mean,
+        ln1_rstd,
+        qkv,
+        atty,
+        preatt,
+        att,
+        attproj,
+        residual2,
+        ln2,
+        ln2_mean,
+        ln2_rstd,
+        fch,
+        fch_gelu,
+        fcproj,
+        residual3,
+        lnf,
+        lnf_mean,
+        lnf_rstd,
+        logits,
+        probs,
+        losses,
+    }
+}
+
 pub struct Gpt2<'a> {
     pub config: Gpt2Config,
     pub params_memory: Vec<f32>,
@@ -84,7 +238,9 @@ pub struct Gpt2<'a> {
 }
 
 impl<'a> Gpt2<'a> {
-    pub fn build_from_checkpoint<P: AsRef<std::path::Path>>(checkpoint_path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn build_from_checkpoint<P: AsRef<std::path::Path>>(
+        checkpoint_path: P,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut file = File::open(checkpoint_path)?;
         let mut model_header = [0i32; 256];
         file.read_exact(bytemuck::bytes_of_mut(&mut model_header))?;
@@ -111,50 +267,14 @@ impl<'a> Gpt2<'a> {
         println!("num_heads: {}", config.num_heads);
         println!("channels: {}", config.channels);
 
-        let param_sizes = [
-            config.vocab_size * config.channels, // wte
-            config.max_seq_len * config.channels, // wpe
-            config.num_layers * config.channels, // ln1w
-            config.num_layers * config.channels, // ln1b
-            config.num_layers * (3 * config.channels) * config.channels, // qkvw
-            config.num_layers * (3 * config.channels), // qkvb
-            config.num_layers * config.channels * config.channels, // attprojw
-            config.num_layers * config.channels, // attprojb
-            config.num_layers * config.channels, // ln2w
-            config.num_layers * config.channels, // ln2b
-            config.num_layers * (4 * config.channels) * config.channels, // fcw
-            config.num_layers * (4 * config.channels), // fcb
-            config.num_layers * config.channels * (4 * config.channels), // fcprojw
-            config.num_layers * config.channels, // fcprojb
-            config.channels, // lnfw
-            config.channels, // lnfb
-        ];
-
+        let param_sizes = parameter_sizes(&config);
         let total_params: usize = param_sizes.iter().sum();
         println!("num_parameters: {}", total_params);
 
         let mut params_memory = vec![0.0f32; total_params];
         file.read_exact(bytemuck::cast_slice_mut(&mut params_memory))?;
 
-        let mut offset = 0;
-        let params = ParameterTensors {
-            wte: &mut params_memory[offset..offset + param_sizes[0]],
-            wpe: &mut params_memory[offset + param_sizes[0]..offset + param_sizes[0] + param_sizes[1]],
-            ln1w: &mut params_memory[offset + param_sizes[0] + param_sizes[1]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2]],
-            ln1b: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3]],
-            qkvw: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4]],
-            qkvb: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5]],
-            attprojw: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6]],
-            attprojb: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7]],
-            ln2w: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8]],
-            ln2b: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9]],
-            fcw: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10]],
-            fcb: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11]],
-            fcprojw: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11] + param_sizes[12]],
-            fcprojb: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11] + param_sizes[12]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11] + param_sizes[12] + param_sizes[13]],
-            lnfw: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11] + param_sizes[12] + param_sizes[13]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11] + param_sizes[12] + param_sizes[13] + param_sizes[14]],
-            lnfb: &mut params_memory[offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11] + param_sizes[12] + param_sizes[13] + param_sizes[14]..offset + param_sizes[0] + param_sizes[1] + param_sizes[2] + param_sizes[3] + param_sizes[4] + param_sizes[5] + param_sizes[6] + param_sizes[7] + param_sizes[8] + param_sizes[9] + param_sizes[10] + param_sizes[11] + param_sizes[12] + param_sizes[13] + param_sizes[14] + param_sizes[15]],
-        };
+        let params = split_parameter_tensors(&mut params_memory[..], &param_sizes);
 
         Ok(Gpt2 {
             config,
@@ -164,26 +284,72 @@ impl<'a> Gpt2<'a> {
             grads_acts_memory: Vec::new(),
             params,
             grads: ParameterTensors {
-                wte: &mut [], wpe: &mut [], ln1w: &mut [], ln1b: &mut [],
-                qkvw: &mut [], qkvb: &mut [], attprojw: &mut [], attprojb: &mut [],
-                ln2w: &mut [], ln2b: &mut [], fcw: &mut [], fcb: &mut [],
-                fcprojw: &mut [], fcprojb: &mut [], lnfw: &mut [], lnfb: &mut [],
+                wte: &mut [],
+                wpe: &mut [],
+                ln1w: &mut [],
+                ln1b: &mut [],
+                qkvw: &mut [],
+                qkvb: &mut [],
+                attprojw: &mut [],
+                attprojb: &mut [],
+                ln2w: &mut [],
+                ln2b: &mut [],
+                fcw: &mut [],
+                fcb: &mut [],
+                fcprojw: &mut [],
+                fcprojb: &mut [],
+                lnfw: &mut [],
+                lnfb: &mut [],
             },
             acts: ActivationTensors {
-                encoded: &mut [], ln1: &mut [], ln1_mean: &mut [], ln1_rstd: &mut [],
-                qkv: &mut [], atty: &mut [], preatt: &mut [], att: &mut [],
-                attproj: &mut [], residual2: &mut [], ln2: &mut [], ln2_mean: &mut [],
-                ln2_rstd: &mut [], fch: &mut [], fch_gelu: &mut [], fcproj: &mut [],
-                residual3: &mut [], lnf: &mut [], lnf_mean: &mut [], lnf_rstd: &mut [],
-                logits: &mut [], probs: &mut [], losses: &mut [],
+                encoded: &mut [],
+                ln1: &mut [],
+                ln1_mean: &mut [],
+                ln1_rstd: &mut [],
+                qkv: &mut [],
+                atty: &mut [],
+                preatt: &mut [],
+                att: &mut [],
+                attproj: &mut [],
+                residual2: &mut [],
+                ln2: &mut [],
+                ln2_mean: &mut [],
+                ln2_rstd: &mut [],
+                fch: &mut [],
+                fch_gelu: &mut [],
+                fcproj: &mut [],
+                residual3: &mut [],
+                lnf: &mut [],
+                lnf_mean: &mut [],
+                lnf_rstd: &mut [],
+                logits: &mut [],
+                probs: &mut [],
+                losses: &mut [],
             },
             grads_acts: ActivationTensors {
-                encoded: &mut [], ln1: &mut [], ln1_mean: &mut [], ln1_rstd: &mut [],
-                qkv: &mut [], atty: &mut [], preatt: &mut [], att: &mut [],
-                attproj: &mut [], residual2: &mut [], ln2: &mut [], ln2_mean: &mut [],
-                ln2_rstd: &mut [], fch: &mut [], fch_gelu: &mut [], fcproj: &mut [],
-                residual3: &mut [], lnf: &mut [], lnf_mean: &mut [], lnf_rstd: &mut [],
-                logits: &mut [], probs: &mut [], losses: &mut [],
+                encoded: &mut [],
+                ln1: &mut [],
+                ln1_mean: &mut [],
+                ln1_rstd: &mut [],
+                qkv: &mut [],
+                atty: &mut [],
+                preatt: &mut [],
+                att: &mut [],
+                attproj: &mut [],
+                residual2: &mut [],
+                ln2: &mut [],
+                ln2_mean: &mut [],
+                ln2_rstd: &mut [],
+                fch: &mut [],
+                fch_gelu: &mut [],
+                fcproj: &mut [],
+                residual3: &mut [],
+                lnf: &mut [],
+                lnf_mean: &mut [],
+                lnf_rstd: &mut [],
+                logits: &mut [],
+                probs: &mut [],
+                losses: &mut [],
             },
             m_memory: Vec::new(),
             v_memory: Vec::new(),
@@ -198,7 +364,10 @@ impl<'a> Gpt2<'a> {
     pub fn allocate_activations(&mut self, B: usize, T: usize) -> Result<(), String> {
         if !self.acts_memory.is_empty() {
             if B > self.batch_size || T > self.seq_len {
-                return Err(format!("Inadequate B or T. Model: {}x{}, Desired: {}x{}", self.batch_size, self.seq_len, B, T));
+                return Err(format!(
+                    "Inadequate B or T. Model: {}x{}, Desired: {}x{}",
+                    self.batch_size, self.seq_len, B, T
+                ));
             }
             return Ok(());
         }
@@ -206,36 +375,7 @@ impl<'a> Gpt2<'a> {
         self.batch_size = B;
         self.seq_len = T;
 
-        let C = self.config.channels;
-        let L = self.config.num_layers;
-        let NH = self.config.num_heads;
-        let V = self.config.vocab_size;
-
-        let act_sizes = [
-            B * T * C, // encoded
-            L * B * T * C, // ln1
-            L * B * T, // ln1_mean
-            L * B * T, // ln1_rstd
-            L * B * T * 3*C, // qkv
-            L * B * T * C, // atty
-            L * B * NH * T * T, // preatt
-            L * B * NH * T * T, // att
-            L * B * T * C, // attproj
-            L * B * T * C, // residual2
-            L * B * T * C, // ln2
-            L * B * T, // ln2_mean
-            L * B * T, // ln2_rstd
-            L * B * T * 4*C, // fch
-            L * B * T * 4*C, // fch_gelu
-            L * B * T * C, // fcproj
-            L * B * T * C, // residual3
-            B * T * C, // lnf
-            B * T, // lnf_mean
-            B * T, // lnf_rstd
-            B * T * V, // logits
-            B * T * V, // probs
-            B * T, // losses
-        ];
+        let act_sizes = activation_sizes(&self.config, B, T);
 
         let total_acts: usize = act_sizes.iter().sum();
         println!("num_activations: {}", total_acts);
@@ -243,59 +383,8 @@ impl<'a> Gpt2<'a> {
         self.acts_memory = vec![0.0f32; total_acts];
         self.grads_acts_memory = vec![0.0f32; total_acts]; // Allocate gradients too
 
-        let mut offset = 0;
-        self.acts = ActivationTensors {
-            encoded: &mut self.acts_memory[offset..offset + act_sizes[0]],
-            ln1: &mut self.acts_memory[offset + act_sizes[0]..offset + act_sizes[0] + act_sizes[1]],
-            ln1_mean: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2]],
-            ln1_rstd: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3]],
-            qkv: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4]],
-            atty: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5]],
-            preatt: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6]],
-            att: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7]],
-            attproj: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8]],
-            residual2: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9]],
-            ln2: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10]],
-            ln2_mean: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11]],
-            ln2_rstd: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12]],
-            fch: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13]],
-            fch_gelu: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14]],
-            fcproj: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15]],
-            residual3: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16]],
-            lnf: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17]],
-            lnf_mean: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18]],
-            lnf_rstd: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19]],
-            logits: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20]],
-            probs: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20] + act_sizes[21]],
-            losses: &mut self.acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20] + act_sizes[21]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20] + act_sizes[21] + act_sizes[22]],
-        };
-
-        offset = 0;
-        self.grads_acts = ActivationTensors {
-            encoded: &mut self.grads_acts_memory[offset..offset + act_sizes[0]],
-            ln1: &mut self.grads_acts_memory[offset + act_sizes[0]..offset + act_sizes[0] + act_sizes[1]],
-            ln1_mean: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2]],
-            ln1_rstd: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3]],
-            qkv: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4]],
-            atty: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5]],
-            preatt: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6]],
-            att: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7]],
-            attproj: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8]],
-            residual2: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9]],
-            ln2: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10]],
-            ln2_mean: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11]],
-            ln2_rstd: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12]],
-            fch: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13]],
-            fch_gelu: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14]],
-            fcproj: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15]],
-            residual3: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16]],
-            lnf: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17]],
-            lnf_mean: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18]],
-            lnf_rstd: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19]],
-            logits: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20]],
-            probs: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20] + act_sizes[21]],
-            losses: &mut self.grads_acts_memory[offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20] + act_sizes[21]..offset + act_sizes[0] + act_sizes[1] + act_sizes[2] + act_sizes[3] + act_sizes[4] + act_sizes[5] + act_sizes[6] + act_sizes[7] + act_sizes[8] + act_sizes[9] + act_sizes[10] + act_sizes[11] + act_sizes[12] + act_sizes[13] + act_sizes[14] + act_sizes[15] + act_sizes[16] + act_sizes[17] + act_sizes[18] + act_sizes[19] + act_sizes[20] + act_sizes[21] + act_sizes[22]],
-        };
+        self.acts = split_activation_tensors(&mut self.acts_memory[..], &act_sizes);
+        self.grads_acts = split_activation_tensors(&mut self.grads_acts_memory[..], &act_sizes);
 
         self.inputs = vec![0; B * T];
         self.targets = vec![0; B * T];
@@ -303,12 +392,18 @@ impl<'a> Gpt2<'a> {
         Ok(())
     }
 
-    pub fn forward(&mut self, inputs: &[i32], targets: Option<&[i32]>, B: usize, T: usize) -> Result<(), String> {
+    pub fn forward(
+        &mut self,
+        inputs: &[i32],
+        targets: Option<&[i32]>,
+        B: usize,
+        T: usize,
+    ) -> Result<(), String> {
         self.allocate_activations(B, T)?;
 
-        self.inputs[..B*T].copy_from_slice(&inputs[..B*T]);
+        self.inputs[..B * T].copy_from_slice(&inputs[..B * T]);
         if let Some(t) = targets {
-            self.targets[..B*T].copy_from_slice(&t[..B*T]);
+            self.targets[..B * T].copy_from_slice(&t[..B * T]);
         }
 
         let C = self.config.channels;
@@ -318,65 +413,122 @@ impl<'a> Gpt2<'a> {
 
         let acts = &mut self.acts;
 
-        crate::layers::encoder_forward(acts.encoded, inputs, self.params.wte, self.params.wpe, B, T, C);
+        crate::layers::encoder_forward(
+            acts.encoded,
+            inputs,
+            self.params.wte,
+            self.params.wpe,
+            B,
+            T,
+            C,
+        );
+
+        let mut prev_residual: &[f32] = &acts.encoded[..];
 
         for l in 0..L {
-            let residual = if l == 0 {
-                acts.encoded
-            } else {
-                &acts.residual3[(l-1) * B * T * C..l * B * T * C]
-            };
+            {
+                let l_ln1w = &self.params.ln1w[l * C..(l + 1) * C];
+                let l_ln1b = &self.params.ln1b[l * C..(l + 1) * C];
+                let l_qkvw = &self.params.qkvw[l * 3 * C * C..(l + 1) * 3 * C * C];
+                let l_qkvb = &self.params.qkvb[l * 3 * C..(l + 1) * 3 * C];
+                let l_attprojw = &self.params.attprojw[l * C * C..(l + 1) * C * C];
+                let l_attprojb = &self.params.attprojb[l * C..(l + 1) * C];
+                let l_ln2w = &self.params.ln2w[l * C..(l + 1) * C];
+                let l_ln2b = &self.params.ln2b[l * C..(l + 1) * C];
+                let l_fcw = &self.params.fcw[l * 4 * C * C..(l + 1) * 4 * C * C];
+                let l_fcb = &self.params.fcb[l * 4 * C..(l + 1) * 4 * C];
+                let l_fcprojw = &self.params.fcprojw[l * C * 4 * C..(l + 1) * C * 4 * C];
+                let l_fcprojb = &self.params.fcprojb[l * C..(l + 1) * C];
 
-            let l_ln1w = &self.params.ln1w[l * C..(l+1) * C];
-            let l_ln1b = &self.params.ln1b[l * C..(l+1) * C];
-            let l_qkvw = &self.params.qkvw[l * 3*C * C..(l+1) * 3*C * C];
-            let l_qkvb = &self.params.qkvb[l * 3*C..(l+1) * 3*C];
-            let l_attprojw = &self.params.attprojw[l * C * C..(l+1) * C * C];
-            let l_attprojb = &self.params.attprojb[l * C..(l+1) * C];
-            let l_ln2w = &self.params.ln2w[l * C..(l+1) * C];
-            let l_ln2b = &self.params.ln2b[l * C..(l+1) * C];
-            let l_fcw = &self.params.fcw[l * 4*C * C..(l+1) * 4*C * C];
-            let l_fcb = &self.params.fcb[l * 4*C..(l+1) * 4*C];
-            let l_fcprojw = &self.params.fcprojw[l * C * 4*C..(l+1) * C * 4*C];
-            let l_fcprojb = &self.params.fcprojb[l * C..(l+1) * C];
+                let l_ln1 = &mut acts.ln1[l * B * T * C..(l + 1) * B * T * C];
+                let l_ln1_mean = &mut acts.ln1_mean[l * B * T..(l + 1) * B * T];
+                let l_ln1_rstd = &mut acts.ln1_rstd[l * B * T..(l + 1) * B * T];
+                let l_qkv = &mut acts.qkv[l * B * T * 3 * C..(l + 1) * B * T * 3 * C];
+                let l_atty = &mut acts.atty[l * B * T * C..(l + 1) * B * T * C];
+                let l_preatt = &mut acts.preatt[l * B * NH * T * T..(l + 1) * B * NH * T * T];
+                let l_att = &mut acts.att[l * B * NH * T * T..(l + 1) * B * NH * T * T];
+                let l_attproj = &mut acts.attproj[l * B * T * C..(l + 1) * B * T * C];
+                let l_residual2 = &mut acts.residual2[l * B * T * C..(l + 1) * B * T * C];
+                let l_ln2 = &mut acts.ln2[l * B * T * C..(l + 1) * B * T * C];
+                let l_ln2_mean = &mut acts.ln2_mean[l * B * T..(l + 1) * B * T];
+                let l_ln2_rstd = &mut acts.ln2_rstd[l * B * T..(l + 1) * B * T];
+                let l_fch = &mut acts.fch[l * B * T * 4 * C..(l + 1) * B * T * 4 * C];
+                let l_fch_gelu = &mut acts.fch_gelu[l * B * T * 4 * C..(l + 1) * B * T * 4 * C];
+                let l_fcproj = &mut acts.fcproj[l * B * T * C..(l + 1) * B * T * C];
+                let l_residual3 = &mut acts.residual3[l * B * T * C..(l + 1) * B * T * C];
 
-            let l_ln1 = &mut acts.ln1[l * B * T * C..(l+1) * B * T * C];
-            let l_ln1_mean = &mut acts.ln1_mean[l * B * T..(l+1) * B * T];
-            let l_ln1_rstd = &mut acts.ln1_rstd[l * B * T..(l+1) * B * T];
-            let l_qkv = &mut acts.qkv[l * B * T * 3*C..(l+1) * B * T * 3*C];
-            let l_atty = &mut acts.atty[l * B * T * C..(l+1) * B * T * C];
-            let l_preatt = &mut acts.preatt[l * B * NH * T * T..(l+1) * B * NH * T * T];
-            let l_att = &mut acts.att[l * B * NH * T * T..(l+1) * B * NH * T * T];
-            let l_attproj = &mut acts.attproj[l * B * T * C..(l+1) * B * T * C];
-            let l_residual2 = &mut acts.residual2[l * B * T * C..(l+1) * B * T * C];
-            let l_ln2 = &mut acts.ln2[l * B * T * C..(l+1) * B * T * C];
-            let l_ln2_mean = &mut acts.ln2_mean[l * B * T..(l+1) * B * T];
-            let l_ln2_rstd = &mut acts.ln2_rstd[l * B * T..(l+1) * B * T];
-            let l_fch = &mut acts.fch[l * B * T * 4*C..(l+1) * B * T * 4*C];
-            let l_fch_gelu = &mut acts.fch_gelu[l * B * T * 4*C..(l+1) * B * T * 4*C];
-            let l_fcproj = &mut acts.fcproj[l * B * T * C..(l+1) * B * T * C];
-            let l_residual3 = &mut acts.residual3[l * B * T * C..(l+1) * B * T * C];
+                crate::layers::layernorm_forward(
+                    l_ln1,
+                    l_ln1_mean,
+                    l_ln1_rstd,
+                    prev_residual,
+                    l_ln1w,
+                    l_ln1b,
+                    B,
+                    T,
+                    C,
+                );
+                crate::layers::matmul_forward(l_qkv, l_ln1, l_qkvw, Some(l_qkvb), B, T, C, 3 * C);
+                crate::layers::attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+                crate::layers::matmul_forward(
+                    l_attproj,
+                    l_atty,
+                    l_attprojw,
+                    Some(l_attprojb),
+                    B,
+                    T,
+                    C,
+                    C,
+                );
+                crate::layers::residual_forward(l_residual2, prev_residual, l_attproj, B * T * C);
+                crate::layers::layernorm_forward(
+                    l_ln2,
+                    l_ln2_mean,
+                    l_ln2_rstd,
+                    l_residual2,
+                    l_ln2w,
+                    l_ln2b,
+                    B,
+                    T,
+                    C,
+                );
+                crate::layers::matmul_forward(l_fch, l_ln2, l_fcw, Some(l_fcb), B, T, C, 4 * C);
+                crate::layers::gelu_forward(l_fch_gelu, l_fch);
+                crate::layers::matmul_forward(
+                    l_fcproj,
+                    l_fch_gelu,
+                    l_fcprojw,
+                    Some(l_fcprojb),
+                    B,
+                    T,
+                    4 * C,
+                    C,
+                );
+                crate::layers::residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
+            }
 
-            crate::layers::layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-            crate::layers::matmul_forward(l_qkv, l_ln1, l_qkvw, Some(l_qkvb), B, T, C, 3*C);
-            crate::layers::attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
-            crate::layers::matmul_forward(l_attproj, l_atty, l_attprojw, Some(l_attprojb), B, T, C, C);
-            crate::layers::residual_forward(l_residual2, residual, l_attproj, B*T*C);
-            crate::layers::layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-            crate::layers::matmul_forward(l_fch, l_ln2, l_fcw, Some(l_fcb), B, T, C, 4*C);
-            crate::layers::gelu_forward(l_fch_gelu, l_fch);
-            crate::layers::matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, Some(l_fcprojb), B, T, 4*C, C);
-            crate::layers::residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+            let start = l * B * T * C;
+            prev_residual = &acts.residual3[start..start + B * T * C];
         }
 
-        let final_residual = &acts.residual3[(L-1) * B * T * C..L * B * T * C];
-        crate::layers::layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, final_residual, self.params.lnfw, self.params.lnfb, B, T, C);
+        let final_residual = &acts.residual3[(L - 1) * B * T * C..L * B * T * C];
+        crate::layers::layernorm_forward(
+            acts.lnf,
+            acts.lnf_mean,
+            acts.lnf_rstd,
+            final_residual,
+            self.params.lnfw,
+            self.params.lnfb,
+            B,
+            T,
+            C,
+        );
         crate::layers::matmul_forward(acts.logits, acts.lnf, self.params.wte, None, B, T, C, V);
         crate::layers::softmax_forward(acts.probs, acts.logits, B, T, V);
 
         if let Some(targets) = targets {
             crate::layers::crossentropy_forward(acts.losses, acts.probs, targets, B, T, V);
-            let mean_loss: f32 = acts.losses[..B*T].iter().sum::<f32>() / (B*T) as f32;
+            let mean_loss: f32 = acts.losses[..B * T].iter().sum::<f32>() / (B * T) as f32;
             self.mean_loss = mean_loss;
         } else {
             self.mean_loss = -1.0;
@@ -399,107 +551,229 @@ impl<'a> Gpt2<'a> {
             panic!("Must call forward with targets before backward");
         }
 
-        if self.grads_memory.is_empty() {
-            self.grads_memory = vec![0.0; self.params_memory.len()];
-            self.grads_acts_memory = vec![0.0; self.acts_memory.len()]; // We already allocated this in forward
-            self.zero_grad();
-        }
-
         let B = self.batch_size;
         let T = self.seq_len;
         let C = self.config.channels;
         let L = self.config.num_layers;
         let NH = self.config.num_heads;
         let V = self.config.vocab_size;
+        if self.grads_memory.is_empty() {
+            let param_sizes = parameter_sizes(&self.config);
+            self.grads_memory = vec![0.0; self.params_memory.len()];
+            self.grads = split_parameter_tensors(&mut self.grads_memory[..], &param_sizes);
+
+            let act_sizes = activation_sizes(&self.config, B, T);
+            self.grads_acts_memory = vec![0.0; self.acts_memory.len()];
+            self.grads_acts = split_activation_tensors(&mut self.grads_acts_memory[..], &act_sizes);
+
+            self.zero_grad();
+        }
 
         let acts = &self.acts;
         let grads_acts = &mut self.grads_acts;
 
         let dloss_mean = 1.0 / (B * T) as f32;
-        for i in 0..B*T {
+        for i in 0..B * T {
             grads_acts.losses[i] = dloss_mean;
         }
 
-        crate::layers::crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, &self.targets, B, T, V);
-        crate::layers::matmul_backward(grads_acts.lnf, self.grads.wte, None, grads_acts.logits, acts.lnf, self.params.wte, B, T, C, V);
+        crate::layers::crossentropy_softmax_backward(
+            grads_acts.logits,
+            grads_acts.losses,
+            acts.probs,
+            &self.targets,
+            B,
+            T,
+            V,
+        );
+        crate::layers::matmul_backward(
+            grads_acts.lnf,
+            self.grads.wte,
+            None,
+            grads_acts.logits,
+            acts.lnf,
+            self.params.wte,
+            B,
+            T,
+            C,
+            V,
+        );
 
-        let mut dresidual = &mut grads_acts.residual3[(L-1) * B * T * C..L * B * T * C];
-        crate::layers::layernorm_backward(dresidual, self.grads.lnfw, self.grads.lnfb, grads_acts.lnf, &acts.residual3[(L-1) * B * T * C..], self.params.lnfw, &acts.lnf_mean, &acts.lnf_rstd, B, T, C);
+        let mut dresidual = &mut grads_acts.residual3[(L - 1) * B * T * C..L * B * T * C];
+        crate::layers::layernorm_backward(
+            dresidual,
+            self.grads.lnfw,
+            self.grads.lnfb,
+            grads_acts.lnf,
+            &acts.residual3[(L - 1) * B * T * C..],
+            self.params.lnfw,
+            &acts.lnf_mean,
+            &acts.lnf_rstd,
+            B,
+            T,
+            C,
+        );
 
         for l in (0..L).rev() {
-            let residual = if l == 0 {
-                acts.encoded
+            let (residual_in, dresidual_in) = if l == 0 {
+                (&acts.encoded[..], &mut grads_acts.encoded[..])
             } else {
-                &acts.residual3[(l-1) * B * T * C..l * B * T * C]
+                let start = (l - 1) * B * T * C;
+                (
+                    &acts.residual3[start..start + B * T * C],
+                    &mut grads_acts.residual3[start..start + B * T * C],
+                )
             };
-            let dresidual_in = if l == 0 {
-                &mut grads_acts.encoded
-            } else {
-                &mut grads_acts.residual3[(l-1) * B * T * C..l * B * T * C]
-            };
 
-            let l_ln1w = &self.params.ln1w[l * C..(l+1) * C];
-            let l_qkvw = &self.params.qkvw[l * 3*C * C..(l+1) * 3*C * C];
-            let l_attprojw = &self.params.attprojw[l * C * C..(l+1) * C * C];
-            let l_ln2w = &self.params.ln2w[l * C..(l+1) * C];
-            let l_fcw = &self.params.fcw[l * 4*C * C..(l+1) * 4*C * C];
-            let l_fcprojw = &self.params.fcprojw[l * C * 4*C..(l+1) * C * 4*C];
+            let l_ln1w = &self.params.ln1w[l * C..(l + 1) * C];
+            let l_qkvw = &self.params.qkvw[l * 3 * C * C..(l + 1) * 3 * C * C];
+            let l_attprojw = &self.params.attprojw[l * C * C..(l + 1) * C * C];
+            let l_ln2w = &self.params.ln2w[l * C..(l + 1) * C];
+            let l_fcw = &self.params.fcw[l * 4 * C * C..(l + 1) * 4 * C * C];
+            let l_fcprojw = &self.params.fcprojw[l * C * 4 * C..(l + 1) * C * 4 * C];
 
-            let dl_ln1w = &mut self.grads.ln1w[l * C..(l+1) * C];
-            let dl_ln1b = &mut self.grads.ln1b[l * C..(l+1) * C];
-            let dl_qkvw = &mut self.grads.qkvw[l * 3*C * C..(l+1) * 3*C * C];
-            let dl_qkvb = &mut self.grads.qkvb[l * 3*C..(l+1) * 3*C];
-            let dl_attprojw = &mut self.grads.attprojw[l * C * C..(l+1) * C * C];
-            let dl_attprojb = &mut self.grads.attprojb[l * C..(l+1) * C];
-            let dl_ln2w = &mut self.grads.ln2w[l * C..(l+1) * C];
-            let dl_ln2b = &mut self.grads.ln2b[l * C..(l+1) * C];
-            let dl_fcw = &mut self.grads.fcw[l * 4*C * C..(l+1) * 4*C * C];
-            let dl_fcb = &mut self.grads.fcb[l * 4*C..(l+1) * 4*C];
-            let dl_fcprojw = &mut self.grads.fcprojw[l * C * 4*C..(l+1) * C * 4*C];
-            let dl_fcprojb = &mut self.grads.fcprojb[l * C..(l+1) * C];
+            let dl_ln1w = &mut self.grads.ln1w[l * C..(l + 1) * C];
+            let dl_ln1b = &mut self.grads.ln1b[l * C..(l + 1) * C];
+            let dl_qkvw = &mut self.grads.qkvw[l * 3 * C * C..(l + 1) * 3 * C * C];
+            let dl_qkvb = &mut self.grads.qkvb[l * 3 * C..(l + 1) * 3 * C];
+            let dl_attprojw = &mut self.grads.attprojw[l * C * C..(l + 1) * C * C];
+            let dl_attprojb = &mut self.grads.attprojb[l * C..(l + 1) * C];
+            let dl_ln2w = &mut self.grads.ln2w[l * C..(l + 1) * C];
+            let dl_ln2b = &mut self.grads.ln2b[l * C..(l + 1) * C];
+            let dl_fcw = &mut self.grads.fcw[l * 4 * C * C..(l + 1) * 4 * C * C];
+            let dl_fcb = &mut self.grads.fcb[l * 4 * C..(l + 1) * 4 * C];
+            let dl_fcprojw = &mut self.grads.fcprojw[l * C * 4 * C..(l + 1) * C * 4 * C];
+            let dl_fcprojb = &mut self.grads.fcprojb[l * C..(l + 1) * C];
 
-            let l_ln1 = &acts.ln1[l * B * T * C..(l+1) * B * T * C];
-            let l_ln1_mean = &acts.ln1_mean[l * B * T..(l+1) * B * T];
-            let l_ln1_rstd = &acts.ln1_rstd[l * B * T..(l+1) * B * T];
-            let l_qkv = &acts.qkv[l * B * T * 3*C..(l+1) * B * T * 3*C];
-            let l_atty = &acts.atty[l * B * T * C..(l+1) * B * T * C];
-            let l_att = &acts.att[l * B * NH * T * T..(l+1) * B * NH * T * T];
-            let l_residual2 = &acts.residual2[l * B * T * C..(l+1) * B * T * C];
-            let l_ln2 = &acts.ln2[l * B * T * C..(l+1) * B * T * C];
-            let l_ln2_mean = &acts.ln2_mean[l * B * T..(l+1) * B * T];
-            let l_ln2_rstd = &acts.ln2_rstd[l * B * T..(l+1) * B * T];
-            let l_fch = &acts.fch[l * B * T * 4*C..(l+1) * B * T * 4*C];
-            let l_fch_gelu = &acts.fch_gelu[l * B * T * 4*C..(l+1) * B * T * 4*C];
+            let l_ln1 = &acts.ln1[l * B * T * C..(l + 1) * B * T * C];
+            let l_ln1_mean = &acts.ln1_mean[l * B * T..(l + 1) * B * T];
+            let l_ln1_rstd = &acts.ln1_rstd[l * B * T..(l + 1) * B * T];
+            let l_qkv = &acts.qkv[l * B * T * 3 * C..(l + 1) * B * T * 3 * C];
+            let l_atty = &acts.atty[l * B * T * C..(l + 1) * B * T * C];
+            let l_att = &acts.att[l * B * NH * T * T..(l + 1) * B * NH * T * T];
+            let l_residual2 = &acts.residual2[l * B * T * C..(l + 1) * B * T * C];
+            let l_ln2 = &acts.ln2[l * B * T * C..(l + 1) * B * T * C];
+            let l_ln2_mean = &acts.ln2_mean[l * B * T..(l + 1) * B * T];
+            let l_ln2_rstd = &acts.ln2_rstd[l * B * T..(l + 1) * B * T];
+            let l_fch = &acts.fch[l * B * T * 4 * C..(l + 1) * B * T * 4 * C];
+            let l_fch_gelu = &acts.fch_gelu[l * B * T * 4 * C..(l + 1) * B * T * 4 * C];
 
-            let dl_ln1 = &mut grads_acts.ln1[l * B * T * C..(l+1) * B * T * C];
-            let dl_qkv = &mut grads_acts.qkv[l * B * T * 3*C..(l+1) * B * T * 3*C];
-            let dl_atty = &mut grads_acts.atty[l * B * T * C..(l+1) * B * T * C];
-            let dl_preatt = &mut grads_acts.preatt[l * B * NH * T * T..(l+1) * B * NH * T * T];
-            let dl_att = &mut grads_acts.att[l * B * NH * T * T..(l+1) * B * NH * T * T];
-            let dl_attproj = &mut grads_acts.attproj[l * B * T * C..(l+1) * B * T * C];
-            let dl_residual2 = &mut grads_acts.residual2[l * B * T * C..(l+1) * B * T * C];
-            let dl_ln2 = &mut grads_acts.ln2[l * B * T * C..(l+1) * B * T * C];
-            let dl_fch = &mut grads_acts.fch[l * B * T * 4*C..(l+1) * B * T * 4*C];
-            let dl_fch_gelu = &mut grads_acts.fch_gelu[l * B * T * 4*C..(l+1) * B * T * 4*C];
-            let dl_fcproj = &mut grads_acts.fcproj[l * B * T * C..(l+1) * B * T * C];
-            let dl_residual3 = &mut grads_acts.residual3[l * B * T * C..(l+1) * B * T * C];
+            let dl_ln1 = &mut grads_acts.ln1[l * B * T * C..(l + 1) * B * T * C];
+            let dl_qkv = &mut grads_acts.qkv[l * B * T * 3 * C..(l + 1) * B * T * 3 * C];
+            let dl_atty = &mut grads_acts.atty[l * B * T * C..(l + 1) * B * T * C];
+            let dl_preatt = &mut grads_acts.preatt[l * B * NH * T * T..(l + 1) * B * NH * T * T];
+            let dl_att = &mut grads_acts.att[l * B * NH * T * T..(l + 1) * B * NH * T * T];
+            let dl_attproj = &mut grads_acts.attproj[l * B * T * C..(l + 1) * B * T * C];
+            let dl_residual2 = &mut grads_acts.residual2[l * B * T * C..(l + 1) * B * T * C];
+            let dl_ln2 = &mut grads_acts.ln2[l * B * T * C..(l + 1) * B * T * C];
+            let dl_fch = &mut grads_acts.fch[l * B * T * 4 * C..(l + 1) * B * T * 4 * C];
+            let dl_fch_gelu = &mut grads_acts.fch_gelu[l * B * T * 4 * C..(l + 1) * B * T * 4 * C];
+            let dl_fcproj = &mut grads_acts.fcproj[l * B * T * C..(l + 1) * B * T * C];
 
-            crate::layers::residual_backward(dresidual_in, dl_fcproj, dresidual, B*T*C);
-            crate::layers::matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+            crate::layers::residual_backward(dresidual_in, dl_fcproj, dresidual, B * T * C);
+            crate::layers::matmul_backward(
+                dl_fch_gelu,
+                dl_fcprojw,
+                dl_fcprojb,
+                dl_fcproj,
+                l_fch_gelu,
+                l_fcprojw,
+                B,
+                T,
+                4 * C,
+                C,
+            );
             crate::layers::gelu_backward(dl_fch, l_fch, dl_fch_gelu);
-            crate::layers::matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
-            crate::layers::layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-            crate::layers::residual_backward(dresidual_in, dl_attproj, dl_residual2, B*T*C);
-            crate::layers::matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
-            crate::layers::attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
-            crate::layers::matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
-            crate::layers::layernorm_backward(dresidual_in, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+            crate::layers::matmul_backward(
+                dl_ln2,
+                dl_fcw,
+                dl_fcb,
+                dl_fch,
+                l_ln2,
+                l_fcw,
+                B,
+                T,
+                C,
+                4 * C,
+            );
+            crate::layers::layernorm_backward(
+                dl_residual2,
+                dl_ln2w,
+                dl_ln2b,
+                dl_ln2,
+                l_residual2,
+                l_ln2w,
+                l_ln2_mean,
+                l_ln2_rstd,
+                B,
+                T,
+                C,
+            );
+            crate::layers::residual_backward(dresidual_in, dl_attproj, dl_residual2, B * T * C);
+            crate::layers::matmul_backward(
+                dl_atty,
+                dl_attprojw,
+                dl_attprojb,
+                dl_attproj,
+                l_atty,
+                l_attprojw,
+                B,
+                T,
+                C,
+                C,
+            );
+            crate::layers::attention_backward(
+                dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH,
+            );
+            crate::layers::matmul_backward(
+                dl_ln1,
+                dl_qkvw,
+                dl_qkvb,
+                dl_qkv,
+                l_ln1,
+                l_qkvw,
+                B,
+                T,
+                C,
+                3 * C,
+            );
+            crate::layers::layernorm_backward(
+                dresidual_in,
+                dl_ln1w,
+                dl_ln1b,
+                dl_ln1,
+                residual_in,
+                l_ln1w,
+                l_ln1_mean,
+                l_ln1_rstd,
+                B,
+                T,
+                C,
+            );
+
+            dresidual = dresidual_in;
         }
 
-        crate::layers::encoder_backward(self.grads.wte, self.grads.wpe, grads_acts.encoded, &self.inputs, B, T, C);
+        crate::layers::encoder_backward(
+            self.grads.wte,
+            self.grads.wpe,
+            grads_acts.encoded,
+            &self.inputs,
+            B,
+            T,
+            C,
+        );
     }
 
-    pub fn update(&mut self, learning_rate: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, t: usize) {
+    pub fn update(
+        &mut self,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        t: usize,
+    ) {
         if self.m_memory.is_empty() {
             self.m_memory = vec![0.0; self.params_memory.len()];
             self.v_memory = vec![0.0; self.params_memory.len()];
@@ -518,7 +792,8 @@ impl<'a> Gpt2<'a> {
             self.m_memory[i] = m;
             self.v_memory[i] = v;
 
-            self.params_memory[i] -= learning_rate * (m_hat / (v_hat.sqrt() + eps) + weight_decay * param);
+            self.params_memory[i] -=
+                learning_rate * (m_hat / (v_hat.sqrt() + eps) + weight_decay * param);
         }
     }
 }
