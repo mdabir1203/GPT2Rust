@@ -4,7 +4,6 @@ use std::io::{Read, Write};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::Parser;
 use nix::mount::{mount, MsFlags};
@@ -32,6 +31,7 @@ struct Config {
     #[arg(required = true, trailing_var_arg = true)]
     command: Vec<String>,
 }
+
 
 fn main() -> Result<()> {
     let cfg = Config::parse();
@@ -229,33 +229,19 @@ impl Drop for Cgroup {
     }
 }
 
-fn write_file(path: PathBuf, data: &[u8]) -> Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .write_all(data)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-fn enable_controller(base: &Path, controller: &str) -> Result<()> {
-    let control_file = base.join("cgroup.subtree_control");
-    let mut current = String::new();
-    if let Ok(mut existing) = OpenOptions::new().read(true).open(&control_file) {
-        existing.read_to_string(&mut current).ok();
+    #[test]
+    fn parse_memory_rejects_invalid_inputs() {
+        assert!(parse_memory("abc").is_err());
+        assert!(parse_memory("12tb").is_err());
+        assert!(parse_memory("").is_err());
     }
-    if !current
-        .split_whitespace()
-        .any(|c| c.trim_start_matches('+') == controller)
-    {
-        OpenOptions::new()
-            .append(true)
-            .open(&control_file)
-            .with_context(|| format!("opening {}", control_file.display()))?
-            .write_all(format!("+{}\n", controller).as_bytes())
-            .with_context(|| format!("enabling controller {}", controller))?;
+
+    #[test]
+    fn parse_cpu_percent_enforces_bounds() {
+        assert_eq!(parse_cpu_percent("1").unwrap(), 1);
+        assert_eq!(parse_cpu_percent("100").unwrap(), 100);
+        assert!(parse_cpu_percent("0").is_err());
+        assert!(parse_cpu_percent("101").is_err());
     }
     Ok(())
 }
@@ -287,49 +273,12 @@ fn parse_memory(input: &str) -> std::result::Result<u64, String> {
     Ok(value.saturating_mul(multiplier))
 }
 
-fn parse_cpu_percent(input: &str) -> std::result::Result<u32, String> {
-    let value: u32 = input
-        .parse()
-        .map_err(|_| format!("invalid cpu percentage: {}", input))?;
-    if (1..=100).contains(&value) {
-        Ok(value)
-    } else {
-        Err("cpu percentage must be between 1 and 100".into())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{parse_cpu_percent, parse_memory, unique_suffix};
-
-    #[test]
-    fn parse_memory_accepts_plain_and_suffixed_values() {
-        assert_eq!(parse_memory("1024").unwrap(), 1024);
-        assert_eq!(parse_memory("1k").unwrap(), 1024);
-        assert_eq!(parse_memory("2M").unwrap(), 2 * 1024 * 1024);
-        assert_eq!(parse_memory("3Gb").unwrap(), 3 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn parse_memory_rejects_invalid_inputs() {
-        assert!(parse_memory("abc").is_err());
-        assert!(parse_memory("12tb").is_err());
-        assert!(parse_memory("").is_err());
-    }
-
-    #[test]
-    fn parse_cpu_percent_enforces_bounds() {
-        assert_eq!(parse_cpu_percent("1").unwrap(), 1);
-        assert_eq!(parse_cpu_percent("100").unwrap(), 100);
-        assert!(parse_cpu_percent("0").is_err());
-        assert!(parse_cpu_percent("101").is_err());
-    }
-
     #[test]
     fn unique_suffix_changes_over_time() {
         let first = unique_suffix();
         let second = unique_suffix();
         assert!(first > 0);
         assert!(second >= first);
+
     }
 }
