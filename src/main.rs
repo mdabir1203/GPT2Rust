@@ -1,203 +1,601 @@
-mod layers;
-mod loader;
-#[cfg(not(test))]
-mod model;
-
-#[cfg(not(test))]
-use model::Gpt2;
-#[cfg(not(test))]
-use loader::DataLoader;
-#[cfg(not(test))]
-use std::fs;
-#[cfg(not(test))]
+use std::env;
+use std::ffi::CString;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Error, ErrorKind, Read, Write};
+use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-#[cfg(not(test))]
-use std::time::Instant;
+use std::ptr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(not(test))]
-const GPT2_EOT: i32 = 50256;
+const STACK_SIZE: usize = 1024 * 1024;
 
-#[cfg(not(test))]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut model = Gpt2::build_from_checkpoint("gpt2_124M.bin")?;
+type Result<T> = std::result::Result<T, io::Error>;
 
-    // --- START: Dynamic Dataset Discovery ---
-    let data_dir = Path::new("data");
-    if !data_dir.exists() {
-        return Err(format!("Data directory '{}' not found", data_dir.display()).into());
+mod linux {
+    use std::os::raw::{c_char, c_int, c_ulong, c_void};
+
+    pub type Pid = c_int;
+    pub const SIGCHLD: c_int = 17;
+    pub const CLONE_NEWUTS: c_int = 0x0400_0000;
+    pub const CLONE_NEWIPC: c_int = 0x0800_0000;
+    pub const CLONE_NEWNS: c_int = 0x0002_0000;
+    pub const CLONE_NEWPID: c_int = 0x2000_0000;
+    pub const CLONE_NEWNET: c_int = 0x4000_0000;
+
+    pub const MS_BIND: c_ulong = 4096;
+    pub const MS_REC: c_ulong = 16384;
+    pub const MS_PRIVATE: c_ulong = 262144;
+    pub const MS_NOSUID: c_ulong = 2;
+    pub const MS_NODEV: c_ulong = 4;
+    pub const MS_NOEXEC: c_ulong = 8;
+
+    extern "C" {
+        pub fn clone(
+            f: extern "C" fn(*mut c_void) -> c_int,
+            child_stack: *mut c_void,
+            flags: c_int,
+            arg: *mut c_void,
+        ) -> c_int;
+        pub fn pipe(fds: *mut c_int) -> c_int;
+        pub fn close(fd: c_int) -> c_int;
+        pub fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+        pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+        pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+        pub fn sethostname(name: *const c_char, len: usize) -> c_int;
+        pub fn chdir(path: *const c_char) -> c_int;
+        pub fn chroot(path: *const c_char) -> c_int;
+        pub fn mount(
+            source: *const c_char,
+            target: *const c_char,
+            fstype: *const c_char,
+            flags: c_ulong,
+            data: *const c_void,
+        ) -> c_int;
+        pub fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     }
 
-    // Read all entries in the data directory
-    let entries = fs::read_dir(data_dir)?;
+    pub unsafe fn wifexited(status: c_int) -> bool {
+        status & 0x7f == 0
+    }
 
-    // Find all files ending with "_train.bin"
-    let mut datasets: Vec<(String, PathBuf, PathBuf)> = Vec::new(); // (name, train_path, val_path)
+    pub unsafe fn wexitstatus(status: c_int) -> c_int {
+        (status >> 8) & 0xff
+    }
 
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
+    pub unsafe fn wifsignaled(status: c_int) -> bool {
+        let sig = status & 0x7f;
+        sig != 0 && sig != 0x7f
+    }
 
-        if path.is_file() {
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                if filename.ends_with("_train.bin") {
-                    // Extract the dataset name (remove "_train.bin")
-                    let dataset_name = filename.strip_suffix("_train.bin").unwrap_or(filename).to_string();
+    pub unsafe fn wtermsig(status: c_int) -> c_int {
+        status & 0x7f
+    }
+}
 
-                    // Construct expected validation file path
-                    let val_filename = format!("{}_val.bin", dataset_name);
-                    let val_path = data_dir.join(&val_filename);
+#[derive(Clone, Debug)]
+struct Config {
+    rootfs: PathBuf,
+    memory: Option<u64>,
+    cpu: Option<u32>,
+    hostname: String,
+    command: Vec<String>,
+}
 
-                    // Check if validation file exists
-                    if val_path.exists() {
-                        datasets.push((dataset_name, path, val_path));
-                    } else {
-                        eprintln!("Warning: Found train file '{}' but no corresponding validation file '{}'. Skipping.", path.display(), val_path.display());
-                    }
-                }
+#[derive(Clone, Debug)]
+struct ChildConfig {
+    rootfs: PathBuf,
+    command: Vec<String>,
+    hostname: String,
+    sync_read: RawFd,
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("mini-docker error: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cfg = parse_args()?;
+    if !cfg.rootfs.is_dir() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("rootfs '{}' must exist", cfg.rootfs.display()),
+        ));
+    }
+    if cfg.command.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "no command specified"));
+    }
+
+    let mut pipe_fds = [0; 2];
+    check(unsafe { linux::pipe(pipe_fds.as_mut_ptr()) }, "pipe")?;
+    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+    let mut stack = vec![0u8; STACK_SIZE];
+    let child_cfg = Box::new(ChildConfig {
+        rootfs: cfg.rootfs.clone(),
+        command: cfg.command.clone(),
+        hostname: cfg.hostname.clone(),
+        sync_read: read_fd,
+    });
+
+    let flags = linux::CLONE_NEWUTS
+        | linux::CLONE_NEWPID
+        | linux::CLONE_NEWNS
+        | linux::CLONE_NEWIPC
+        | linux::CLONE_NEWNET
+        | linux::SIGCHLD;
+    let ptr = Box::into_raw(child_cfg) as *mut std::ffi::c_void;
+    let stack_top = unsafe { stack.as_mut_ptr().add(STACK_SIZE) } as *mut std::ffi::c_void;
+    let pid = unsafe { linux::clone(child_trampoline, stack_top, flags, ptr) };
+    if pid < 0 {
+        unsafe {
+            drop(Box::from_raw(ptr as *mut ChildConfig));
+        }
+        return Err(last_error("clone"));
+    }
+
+    let controller = match Cgroup::new(cfg.memory, cfg.cpu) {
+        Ok(cg) => cg,
+        Err(err) => {
+            unsafe {
+                let _ = linux::close(read_fd);
+                let _ = linux::close(write_fd);
+            }
+            let _ = wait_for_child(pid);
+            return Err(err);
+        }
+    };
+    controller.attach(pid)?;
+    check(unsafe { linux::close(read_fd) }, "close")?;
+    write_all(write_fd, &[1])?;
+    check(unsafe { linux::close(write_fd) }, "close")?;
+    wait_for_child(pid)
+}
+
+fn parse_args() -> Result<Config> {
+    let mut args = env::args().skip(1).peekable();
+    let mut rootfs = None;
+    let mut memory = None;
+    let mut cpu = None;
+    let mut hostname = String::from("mini-docker");
+    let mut command = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--rootfs" => rootfs = Some(PathBuf::from(expect_value(&mut args, "--rootfs")?)),
+            "--memory" => {
+                let value = expect_value(&mut args, "--memory")?;
+                memory =
+                    Some(parse_memory(&value).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?);
+            }
+            "--cpu" => {
+                let value = expect_value(&mut args, "--cpu")?;
+                cpu = Some(
+                    parse_cpu_percent(&value)
+                        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?,
+                );
+            }
+            "--hostname" => hostname = expect_value(&mut args, "--hostname")?,
+            "--" => {
+                command.extend(args);
+                break;
+            }
+            other if other.starts_with("--") => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("unknown option {other}"),
+                ))
+            }
+            _ => {
+                command.push(arg);
+                command.extend(args);
+                break;
             }
         }
     }
+    let rootfs =
+        rootfs.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "--rootfs is required"))?;
+    Ok(Config {
+        rootfs,
+        memory,
+        cpu,
+        hostname,
+        command,
+    })
+}
 
-    if datasets.is_empty() {
-        return Err("No valid datasets found. Expected files like 'dataset_name_train.bin' and 'dataset_name_val.bin' in the 'data/' directory.".into());
-    }
+fn expect_value(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    flag: &str,
+) -> Result<String> {
+    args.next()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("{flag} requires a value")))
+}
 
-    // Print available datasets
-    println!("Available datasets:");
-    for (i, (name, train_path, val_path)) in datasets.iter().enumerate() {
-        println!("  {}: {}", i + 1, name);
-        println!("    Train: {}", train_path.display());
-        println!("    Val:   {}", val_path.display());
-    }
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("path '{}' contains an embedded null byte", path.display()),
+        )
+    })
+}
 
-    // Choose the first dataset by default
-    // TODO: Extend this to accept a command-line argument for dataset selection
-    let chosen_idx = 0;
-    let (dataset_name, train_path, val_path) = &datasets[chosen_idx];
-    println!("\nUsing dataset: '{}'", dataset_name);
-    // --- END: Dynamic Dataset Discovery ---
-
-    let B = 4;
-    let T = 64;
-
-    let mut train_loader = DataLoader::new(train_path, B, T)?;
-    println!("train dataset num_batches: {}", train_loader.num_batches);
-
-    let mut val_loader = DataLoader::new(val_path, B, T)?;
-    println!("val dataset num_batches: {}", val_loader.num_batches);
-    let val_num_batches = 10;
-
-    // RNG for sampling
-    let mut rng_state: u64 = 1337;
-    const GEN_MAX_LENGTH: usize = 64;
-    let mut gen_tokens = vec![0i32; GEN_MAX_LENGTH];
-
-    for step in 0..=40 {
-        // Validation
-        if step % 10 == 0 {
-            let mut val_loss = 0.0f32;
-            val_loader.reset();
-            for _ in 0..val_num_batches {
-                val_loader.next_batch()?;
-                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T)?;
-                val_loss += model.mean_loss;
+extern "C" fn child_trampoline(arg: *mut std::ffi::c_void) -> i32 {
+    unsafe {
+        let cfg = Box::from_raw(arg as *mut ChildConfig);
+        let status = match child_main(&cfg) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("[mini-docker] child error: {err}");
+                1
             }
-            println!("step {}: val loss {}", step, val_loss / val_num_batches as f32);
+        };
+        let _ = linux::close(cfg.sync_read);
+        status
+    }
+}
+
+fn child_main(cfg: &ChildConfig) -> Result<()> {
+    set_hostname(&cfg.hostname)?;
+    let mut buf = [0u8; 1];
+    read_all(cfg.sync_read, &mut buf)?;
+    check(unsafe { linux::close(cfg.sync_read) }, "close")?;
+    setup_rootfs(&cfg.rootfs)?;
+    exec_command(&cfg.command)
+}
+
+fn set_hostname(name: &str) -> Result<()> {
+    let c =
+        CString::new(name).map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid hostname"))?;
+    check(
+        unsafe { linux::sethostname(c.as_ptr(), name.len()) },
+        "sethostname",
+    )
+}
+
+fn setup_rootfs(rootfs: &Path) -> Result<()> {
+    for dir in ["proc", "sys", "tmp"] {
+        let path = rootfs.join(dir);
+        if !path.exists() {
+            fs::create_dir_all(&path)?;
         }
-
-        // Sampling
-        if step > 0 && step % 20 == 0 {
-            gen_tokens[0] = GPT2_EOT;
-            for t in 1..GEN_MAX_LENGTH {
-                model.forward(&gen_tokens[..t], None, 1, t)?;
-                let probs = &model.acts.probs[(t-1) * model.config.vocab_size..t * model.config.vocab_size];
-                let coin = random_f32(&mut rng_state);
-                let next_token = sample_mult(probs, model.config.vocab_size, coin) as i32;
-                gen_tokens[t] = next_token;
-            }
-            print!("step {} generated: ", step);
-            for &token in &gen_tokens[..] {
-                print!("{} ", token);
-            }
-            println!();
-        }
-
-        // Training Step
-        let start = Instant::now();
-        train_loader.next_batch()?;
-        model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T)?;
-        model.zero_grad();
-        model.backward();
-        model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step + 1);
-        let duration = start.elapsed();
-
-        println!("step {}: train loss {} (took {} ms)", step, model.mean_loss, duration.as_millis());
     }
+    mount_call(
+        None,
+        Path::new("/"),
+        None,
+        linux::MS_REC | linux::MS_PRIVATE,
+        None,
+    )?;
+    bind_mount(rootfs, rootfs)?;
+    chdir(rootfs)?;
+    chroot_to_current()?;
+    chdir(Path::new("/"))?;
+    mount_call(
+        Some("proc"),
+        Path::new("/proc"),
+        Some("proc"),
+        linux::MS_NOSUID | linux::MS_NOEXEC | linux::MS_NODEV,
+        None,
+    )?;
+    mount_call(
+        Some("sysfs"),
+        Path::new("/sys"),
+        Some("sysfs"),
+        linux::MS_NOSUID | linux::MS_NOEXEC | linux::MS_NODEV,
+        None,
+    )?;
+    mount_call(
+        Some("tmpfs"),
+        Path::new("/tmp"),
+        Some("tmpfs"),
+        0,
+        Some("mode=1777"),
+    )
+}
 
+fn mount_call(
+    source: Option<&str>,
+    target: &Path,
+    fstype: Option<&str>,
+    flags: u64,
+    data: Option<&str>,
+) -> Result<()> {
+    let src = source.map(|s| CString::new(s).unwrap());
+    let tgt = path_to_cstring(target)?;
+    let fstype = fstype.map(|f| CString::new(f).unwrap());
+    let data_c = data.map(|d| CString::new(d).unwrap());
+    let result = unsafe {
+        linux::mount(
+            src.as_ref().map(|s| s.as_ptr()).unwrap_or(ptr::null()),
+            tgt.as_ptr(),
+            fstype.as_ref().map(|f| f.as_ptr()).unwrap_or(ptr::null()),
+            flags,
+            data_c
+                .as_ref()
+                .map(|d| d.as_ptr() as *const std::ffi::c_void)
+                .unwrap_or(ptr::null()),
+        )
+    };
+    check(result, "mount")
+}
+
+fn bind_mount(source: &Path, target: &Path) -> Result<()> {
+    let src = path_to_cstring(source)?;
+    let tgt = path_to_cstring(target)?;
+    let result = unsafe {
+        linux::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            ptr::null(),
+            linux::MS_BIND | linux::MS_REC,
+            ptr::null(),
+        )
+    };
+    check(result, "bind mount")
+}
+
+fn chdir(path: &Path) -> Result<()> {
+    let c = path_to_cstring(path)?;
+    check(unsafe { linux::chdir(c.as_ptr()) }, "chdir")
+}
+
+fn chroot_to_current() -> Result<()> {
+    let dot = CString::new(".").unwrap();
+    check(unsafe { linux::chroot(dot.as_ptr()) }, "chroot")
+}
+
+fn exec_command(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "no command to exec"));
+    }
+    let mut c_args = Vec::with_capacity(args.len());
+    for arg in args {
+        c_args.push(
+            CString::new(arg.as_str())
+                .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid string"))?,
+        );
+    }
+    let mut raw: Vec<*const std::ffi::c_char> = c_args.iter().map(|s| s.as_ptr()).collect();
+    raw.push(ptr::null());
+    let status = unsafe { linux::execvp(raw[0], raw.as_ptr()) };
+    if status == -1 {
+        Err(last_error("execvp"))
+    } else {
+        Ok(())
+    }
+}
+
+fn wait_for_child(pid: linux::Pid) -> Result<()> {
+    let mut status = 0;
+    check(unsafe { linux::waitpid(pid, &mut status, 0) }, "waitpid")?;
+    if unsafe { linux::wifexited(status) } {
+        match unsafe { linux::wexitstatus(status) } {
+            0 => Ok(()),
+            code => Err(Error::new(
+                ErrorKind::Other,
+                format!("container exited with status {code}"),
+            )),
+        }
+    } else if unsafe { linux::wifsignaled(status) } {
+        Err(Error::new(
+            ErrorKind::Other,
+            format!("container terminated by signal {}", unsafe {
+                linux::wtermsig(status)
+            }),
+        ))
+    } else {
+        Err(Error::new(ErrorKind::Other, "unexpected wait status"))
+    }
+}
+
+fn read_all(fd: RawFd, buf: &mut [u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let res = unsafe {
+            linux::read(
+                fd,
+                buf[offset..].as_mut_ptr() as *mut std::ffi::c_void,
+                buf.len() - offset,
+            )
+        };
+        if res == -1 {
+            let err = last_error("read");
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if res == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "pipe closed"));
+        }
+        offset += res as usize;
+    }
     Ok(())
 }
 
-// Simple RNG (Xorshift)
-fn random_u32(state: &mut u64) -> u32 {
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    ((*state).wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
-}
-
-fn random_f32(state: &mut u64) -> f32 {
-    (random_u32(state) >> 8) as f32 / 16777216.0
-}
-
-fn sample_mult(probabilities: &[f32], n: usize, coin: f32) -> usize {
-    let mut cdf = 0.0;
-    for (i, &p) in probabilities.iter().enumerate() {
-        cdf += p;
-        if coin < cdf {
-            return i;
+fn write_all(fd: RawFd, buf: &[u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let res = unsafe {
+            linux::write(
+                fd,
+                buf[offset..].as_ptr() as *const std::ffi::c_void,
+                buf.len() - offset,
+            )
+        };
+        if res == -1 {
+            let err = last_error("write");
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
         }
+        offset += res as usize;
     }
-    n - 1
+    Ok(())
+}
+
+fn check(result: i32, action: &str) -> Result<()> {
+    if result == -1 {
+        Err(last_error(action))
+    } else {
+        Ok(())
+    }
+}
+
+fn last_error(action: &str) -> io::Error {
+    let err = io::Error::last_os_error();
+    Error::new(err.kind(), format!("{action}: {err}"))
+}
+
+struct Cgroup {
+    path: PathBuf,
+    memory: Option<u64>,
+    cpu: Option<u32>,
+}
+
+impl Cgroup {
+    fn new(memory: Option<u64>, cpu: Option<u32>) -> Result<Self> {
+        let base = PathBuf::from("/sys/fs/cgroup");
+        if !base.join("cgroup.controllers").exists() {
+            return Err(Error::new(ErrorKind::Other, "cgroup v2 is required"));
+        }
+        if memory.is_some() {
+            enable_controller(&base, "memory")?;
+        }
+        if cpu.is_some() {
+            enable_controller(&base, "cpu")?;
+        }
+        let path = base.join(format!("mini-docker-{}", unique_suffix()));
+        fs::create_dir_all(&path)?;
+        let cg = Self { path, memory, cpu };
+        cg.apply_limits()?;
+        Ok(cg)
+    }
+
+    fn apply_limits(&self) -> Result<()> {
+        if let Some(bytes) = self.memory {
+            write_file(self.path.join("memory.max"), bytes.to_string())?;
+        }
+        if let Some(percent) = self.cpu {
+            let period = 100_000u64;
+            let quota = (period * percent as u64).max(100) / 100;
+            write_file(self.path.join("cpu.max"), format!("{quota} {period}"))?;
+        }
+        Ok(())
+    }
+
+    fn attach(&self, pid: linux::Pid) -> Result<()> {
+        write_file(self.path.join("cgroup.procs"), pid.to_string())
+    }
+}
+
+impl Drop for Cgroup {
+    fn drop(&mut self) {
+        let _ = write_file(self.path.join("cpu.max"), "max 100000");
+        let _ = write_file(self.path.join("memory.max"), "max");
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn write_file(path: PathBuf, data: impl AsRef<[u8]>) -> Result<()> {
+    let mut file = OpenOptions::new().write(true).truncate(true).open(&path)?;
+    file.write_all(data.as_ref())?;
+    Ok(())
+}
+
+fn enable_controller(base: &Path, controller: &str) -> Result<()> {
+    let control_file = base.join("cgroup.subtree_control");
+    let mut existing = String::new();
+    if let Ok(mut file) = OpenOptions::new().read(true).open(&control_file) {
+        file.read_to_string(&mut existing)?;
+    }
+    if !existing
+        .split_whitespace()
+        .any(|item| item.trim_start_matches('+') == controller)
+    {
+        let mut file = OpenOptions::new().append(true).open(&control_file)?;
+        file.write_all(format!("+{}\n", controller).as_bytes())?;
+    }
+    Ok(())
+}
+
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default()
+}
+
+fn parse_memory(input: &str) -> std::result::Result<u64, String> {
+    let trimmed = input.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err("memory size cannot be empty".into());
+    }
+    let (number, suffix) = trimmed
+        .chars()
+        .position(|c| !c.is_ascii_digit())
+        .map(|idx| trimmed.split_at(idx))
+        .unwrap_or((trimmed.as_str(), ""));
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid number: {input}"))?;
+    let multiplier = match suffix {
+        "" => 1,
+        "k" | "kb" => 1 << 10,
+        "m" | "mb" => 1 << 20,
+        "g" | "gb" => 1 << 30,
+        _ => return Err(format!("unknown size suffix: {suffix}")),
+    };
+    Ok(value.saturating_mul(multiplier))
+}
+
+fn parse_cpu_percent(input: &str) -> std::result::Result<u32, String> {
+    let value: u32 = input
+        .parse()
+        .map_err(|_| format!("invalid cpu percentage: {input}"))?;
+    if (1..=100).contains(&value) {
+        Ok(value)
+    } else {
+        Err("cpu percentage must be between 1 and 100".into())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn random_u32_matches_reference_implementation() {
-        let mut state = 123_456_789u64;
-        let mut reference_state = state;
-        reference_state ^= reference_state >> 12;
-        reference_state ^= reference_state << 25;
-        reference_state ^= reference_state >> 27;
-        let expected = ((reference_state.wrapping_mul(0x2545F4914F6CDD1D)) >> 32) as u32;
+    use super::{parse_cpu_percent, parse_memory, unique_suffix};
 
-        let value = super::random_u32(&mut state);
-        assert_eq!(value, expected);
-        assert_eq!(state, reference_state);
+    #[test]
+    fn parse_memory_handles_common_suffixes() {
+        assert_eq!(parse_memory("1024").unwrap(), 1024);
+        assert_eq!(parse_memory("1k").unwrap(), 1024);
+        assert_eq!(parse_memory("2M").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_memory("3Gb").unwrap(), 3 * 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn random_f32_produces_value_in_unit_interval() {
-        let mut state = 987_654_321u64;
-        let mut reference_state = state;
-        reference_state ^= reference_state >> 12;
-        reference_state ^= reference_state << 25;
-        reference_state ^= reference_state >> 27;
-        let rand = ((reference_state.wrapping_mul(0x2545F4914F6CDD1D)) >> 32) as u32;
-        let expected = ((rand >> 8) as f32) / 16_777_216.0;
-
-        let value = super::random_f32(&mut state);
-        assert!(value >= 0.0 && value < 1.0);
-        assert!((value - expected).abs() < 1e-7);
-        assert_eq!(state, reference_state);
+    fn parse_memory_rejects_invalid_inputs() {
+        assert!(parse_memory("abc").is_err());
+        assert!(parse_memory("12tb").is_err());
+        assert!(parse_memory("").is_err());
     }
 
     #[test]
-    fn sample_mult_selects_based_on_cumulative_probability() {
-        let probabilities = [0.1, 0.2, 0.7];
-        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.05), 0);
-        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.1), 1);
-        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.3), 2);
-        assert_eq!(super::sample_mult(&probabilities, probabilities.len(), 0.95), 2);
+    fn parse_cpu_percent_checks_bounds() {
+        assert_eq!(parse_cpu_percent("1").unwrap(), 1);
+        assert_eq!(parse_cpu_percent("100").unwrap(), 100);
+        assert!(parse_cpu_percent("0").is_err());
+        assert!(parse_cpu_percent("101").is_err());
+    }
+
+    #[test]
+    fn unique_suffix_monotonicity() {
+        let first = unique_suffix();
+        let second = unique_suffix();
+        assert!(first > 0);
+        assert!(second >= first);
     }
 }

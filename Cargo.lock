@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "gpt2-rs"
+name = "mini-docker"
 version = "0.1.0"

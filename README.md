@@ -1,273 +1,268 @@
-# GPT2Rust
+# Mini Docker in Rust
 
-A compact, pure Rust reimplementation of the GPT-2 training and inference stack. The
-code emphasises explicit tensor operations, manual memory management and an
-easy-to-follow control flow so that the complete transformer pipeline can be read,
-modified and experimented with without relying on external deep-learning crates.
+This repository contains a pedagogical, single-binary container runtime that
+reimplements a subset of Docker's process-isolation features in roughly three
+hundred lines of Rust. The program uses Linux namespaces to create an isolated
+UTS/PID/IPC/NET/MOUNT environment, wires the process into a dedicated cgroup v2
+hierarchy, then pivots into a BusyBox-style root filesystem before executing the
+requested command.
+
+The runtime favours readability and explicit error handling so that you can
+trace every syscall. This README concentrates on verifying that the runtime
+actually provides isolation and resource-limiting guarantees, and documents the
+unit tests that keep the Rust code honest.
 
 ## Table of Contents
-- [Project Objectives](#project-objectives)
-- [Repository Map](#repository-map)
-- [Component Deep Dive](#component-deep-dive)
-  - [Low level kernels (`src/layers.rs`)](#low-level-kernels-srclayersrs)
-  - [Model orchestration (`src/model.rs`)](#model-orchestration-srcmodelrs)
-  - [Streaming data loader (`src/loader.rs`)](#streaming-data-loader-srcloaderrs)
-  - [Executable entry point (`src/main.rs`)](#executable-entry-point-srcmainrs)
-  - [Dataset bootstrap script (`downloaddataset.sh`)](#dataset-bootstrap-script-downloaddatasetsh)
-- [Execution Flow](#execution-flow)
-- [Model Architecture Overview](#model-architecture-overview)
-- [Data and Checkpoint Files](#data-and-checkpoint-files)
-- [Building and Running](#building-and-running)
-- [Extending the Project](#extending-the-project)
-- [Current Gaps & TODOs](#current-gaps--todos)
-- [Further Reading](#further-reading)
 
-## Project Objectives
+- [Prerequisites](#prerequisites)
+- [Building](#building)
+- [Test Matrix Overview](#test-matrix-overview)
+- [Preparing a Minimal Root Filesystem](#preparing-a-minimal-root-filesystem)
+- [Happy-Path Container Execution](#happy-path-container-execution)
+- [Resource Limit Validation](#resource-limit-validation)
+  - [Memory Pressure Scenarios](#memory-pressure-scenarios)
+  - [CPU Throttling Scenarios](#cpu-throttling-scenarios)
+- [Filesystem Isolation Checks](#filesystem-isolation-checks)
+- [Networking Containment Checks](#networking-containment-checks)
+- [Failure Mode Drills](#failure-mode-drills)
+- [Rust Unit Tests](#rust-unit-tests)
+- [Troubleshooting Checklist](#troubleshooting-checklist)
+- [Further Exploration](#further-exploration)
 
-The repository mirrors the C reference implementation that ships with Andrej
-Karpathy's GPT-2 micrograd projects, but reimagined in idiomatic Rust. The focus is
-on:
+## Prerequisites
 
-* **Transparency** – every tensor operation is written out and easy to debug.
-* **Determinism** – random number generation and optimisation are fully controlled.
-* **Experimentation** – the model struct exposes memory buffers that can be modified
-  or instrumented for research.
+| Requirement | Why it matters | How to verify |
+|-------------|----------------|----------------|
+| Linux kernel with namespace & cgroup v2 support | All isolation primitives depend on them. | `ls /proc/self/ns && ls /sys/fs/cgroup/cgroup.controllers` |
+| Root or a user with `CAP_SYS_ADMIN` | Mount, chroot, and cgroup operations require elevated privileges. | `id -u` should print `0` or verify capabilities with `capsh --print`. |
+| BusyBox (or equivalent minimal rootfs) | Provides shell utilities inside the container. | `busybox --help` |
+| Rust toolchain (`cargo`, `rustc`) | Builds the runtime and runs unit tests. | `cargo --version` |
 
-## Repository Map
+Mental model: treat the runtime as an orchestra conductor. Each prerequisite is
+an instrument that must be tuned before the performance can start.
 
-| Path | Description |
-|------|-------------|
-| `Cargo.toml` | Crate metadata and dependency declarations. |
-| `README.md` | This guide. |
-| `downloaddataset.sh` | Convenience script that downloads weights and token files from the LLMC starter pack. |
-| `src/layers.rs` | Collection of stateless tensor kernels (attention, layer norm, GELU, matmul, etc.). |
-| `src/loader.rs` | Mini-batch streaming loader for memory-mapped token datasets. |
-| `src/main.rs` | Binary entry point containing the training loop, evaluation and sampling code. |
-| `src/model.rs` | High-level transformer assembly that wires kernels together and manages parameters/activations. |
+## Building
 
-## Component Deep Dive
+1. Fetch dependencies and compile in release mode for predictable behaviour:
 
-### Low level kernels (`src/layers.rs`)
+   ```bash
+   cargo build --release
+   ```
 
-This module contains the raw mathematical primitives. They operate on contiguous
-slices (`&[f32]`/`&mut [f32]`) with no heap allocation.
+2. Optionally run `cargo fmt` to ensure formatting consistency. The code is
+   deliberately compact, so formatting aids future diffs.
 
-* **GELU activation** – implemented twice: a scalar fallback and an AVX2 accelerated
-  version toggled at runtime via `is_x86_feature_detected!("avx2")`. Both use a
-  quintic polynomial approximation for speed.
-* **Embedding encoder** – adds learned token (`wte`) and positional (`wpe`) vectors
-  for each token in a batch.
-* **Layer Normalisation** – forward and backward passes with explicit reduction
-  loops tracking per-token mean and reciprocal standard deviation.
-* **Matrix multiplication** – dense linear layers with optional bias handling,
-  implemented in terms of nested loops to keep data dependencies explicit.
-* **Self-attention** – causal multi-head attention forward and backward passes. The
-  implementation materialises `preatt` (scaled dot products before softmax) and
-  `att` (softmaxed weights) buffers to keep intermediate results for the backward
-  sweep.
-* **Residual connections** – element-wise additions used throughout the transformer
-  blocks.
-* **Softmax & Cross-entropy** – numerically stable softmax followed by loss and
-  gradient helpers tailored to autoregressive language modelling.
+3. Confirm the binary exists:
 
-The module is intentionally stateless; all mutable state is owned by the caller in
-`model.rs`.
+   ```bash
+   file target/release/mini-docker
+   ```
 
-### Model orchestration (`src/model.rs`)
+Think of this phase as setting the stage—no tests should run until the binary is
+known-good.
 
-`model.rs` provides the `Gpt2` struct which owns every tensor buffer required for
-training, evaluation and sampling:
+## Test Matrix Overview
 
-* **Configuration (`Gpt2Config`)** – derived from a checkpoint header and contains
-  model hyper-parameters (sequence length, vocabulary size, number of layers,
-  heads and embedding channels).
-* **ParameterTensors / ActivationTensors** – typed views that slice the underlying
-  `Vec<f32>` buffers into semantically meaningful ranges. Separate instances exist
-  for parameters, gradients, activations and activation gradients. This keeps the
-  borrow checker satisfied while still operating on flat arrays.
-* **`build_from_checkpoint`** – reads a binary checkpoint (`gpt2_124M.bin`) using a
-  lightweight header (magic number, version and configuration). Parameters are
-  memory-mapped into the `params_memory` buffer and sliced into the `params`
-  struct.
-* **`allocate_activations`** – lazily allocates activation/gradient buffers for a
-  requested batch size `B` and sequence length `T`, reusing existing memory if the
-  request fits in previously allocated space. This function computes the exact size
-  of each intermediate tensor (e.g. per-layer QKV projections, attention scores,
-  feed-forward activations) so that the rest of the code can index safely.
-* **`forward`** – orchestrates one pass through the network. It runs the embedding
-  stage, each transformer block (layer norm → QKV projection → attention →
-  projection → residual → MLP → GELU → projection → residual) and finally projects
-  onto vocabulary logits before computing probabilities and optional losses.
-* **`zero_grad`** – clears parameter and activation gradients.
-* **`backward`** – mirrors the forward pass in reverse, distributing gradients to
-  every parameter tensor using the helpers in `layers.rs`.
-* **`update`** – applies an Adam-style update with decoupled weight decay, keeping
-  first (`m_memory`) and second (`v_memory`) moment buffers.
+Before diving into shell commands, align expectations using the following
+matrix. It groups scenarios by goal and helps prioritise what to test first.
 
-All tensors remain on the CPU. There are no external BLAS dependencies; everything
-runs through Rust loops.
+| Goal | Mental Model | Primary Check | Edge Cases |
+|------|--------------|---------------|------------|
+| Baseline execution | "Does the light turn on?" | Container launches BusyBox shell | Missing rootfs, invalid command |
+| Memory limits | "Turn the dial until the fuse blows." | Process killed when exceeding limit | Child ignoring limit, swap usage |
+| CPU limits | "Hourglass throttle." | Loop slows under capped quota | Multi-threaded workloads |
+| Filesystem isolation | "Clean-room lab." | Host files hidden inside container | Bind mounts, tmpfs persistence |
+| Networking isolation | "Airplane mode." | Container can't reach external hosts | Localhost-only services |
+| Failure handling | "Fire drill." | Clear error messages & cleanup | Partial setup, repeated runs |
 
-### Streaming data loader (`src/loader.rs`)
+## Preparing a Minimal Root Filesystem
 
-`DataLoader` streams contiguous 32-bit token IDs from binary files. It tracks the
-current file position, rewinds when the end is reached and exposes three buffers
-per batch:
+1. Create a workspace and populate it with BusyBox:
 
-* `batch` – raw tokens read from disk (with an extra token for the next-step target).
-* `inputs` – the slice fed into the model.
-* `targets` – the input shifted by one token, used for the autoregressive loss.
+   ```bash
+   ROOTFS=$PWD/rootfs
+   mkdir -p "$ROOTFS"
+   busybox --install -s "$ROOTFS/bin"
+   mkdir -p "$ROOTFS"/{dev,proc,sys,tmp,etc}
+   printf 'root:x:0:0:root:/root:/bin/sh\n' > "$ROOTFS/etc/passwd"
+   printf 'nameserver 1.1.1.1\n' > "$ROOTFS/etc/resolv.conf"
+   ```
 
-Datasets must be stored as little-endian `i32` values produced by the original
-Python scripts in the LLMC starter pack.
+2. Add essential device nodes (requires root):
 
-### Executable entry point (`src/main.rs`)
+   ```bash
+   mknod -m 666 "$ROOTFS/dev/null" c 1 3
+   mknod -m 666 "$ROOTFS/dev/zero" c 1 5
+   mknod -m 666 "$ROOTFS/dev/random" c 1 8
+   mknod -m 666 "$ROOTFS/dev/urandom" c 1 9
+   ```
 
-The binary stitches everything together:
+3. Verify layout:
 
-1. Loads a GPT-2 checkpoint (`gpt2_124M.bin`) located next to the executable.
-2. Scans the `data/` directory for matching `*_train.bin`/`*_val.bin` pairs.
-3. Instantiates a `DataLoader` for the chosen dataset (currently the first match).
-4. Runs a simple training loop:
-   * Every tenth step the model is evaluated on `val_num_batches` batches.
-   * Every twentieth step tokens are sampled autoregressively to inspect progress.
-   * Each iteration executes `forward → zero_grad → backward → update`.
-5. Reports loss values and iteration timings.
+   ```bash
+   tree -L 2 "$ROOTFS"
+   ```
 
-`random_u32`, `random_f32` and `sample_mult` form a tiny xorshift RNG used during
-sampling to convert probability distributions into discrete token IDs.
+Mental model: build a dollhouse—every room (directory) must exist before the
+runtime can move in furniture (mounts).
 
-### Dataset bootstrap script (`downloaddataset.sh`)
-
-Shell script that downloads:
-
-* Pre-trained GPT-2 weights and auxiliary debug snapshots.
-* Tokeniser binary.
-* Token datasets (`tiny_shakespeare_*`, `hellaswag_*`).
-
-Files prefixed with `tiny_shakespeare` or `hellaswag` are saved under
-`data/tinyshakespeare/` and `data/hellaswag/` respectively; other files go to the
-repository root. To use them with the current Rust binary either move or symlink the
-train/val files into `data/` so they follow the `<name>_train.bin` / `<name>_val.bin`
-pattern that `main.rs` expects.
-
-## Execution Flow
-
-```
-+------------------+      +------------------+      +----------------------+      +-----------------+
-| downloaddataset  |      | DataLoader       |      | Gpt2::forward        |      | Training Loop   |
-| (prepare data)   +----->+ (stream tokens)  +----->+ (run transformer)    +----->+ (backward+Adam) |
-+------------------+      +------------------+      +----------------------+      +-----------------+
-                                                              |
-                                                              v
-                                                     logits / losses / samples
-```
-
-At runtime the program performs the following steps per iteration:
-
-1. `DataLoader::next_batch` fills `inputs`/`targets` with `B*T` token IDs.
-2. `Gpt2::forward` computes logits and losses, storing every intermediate tensor.
-3. `Gpt2::zero_grad` clears buffers.
-4. `Gpt2::backward` accumulates gradients for parameters and activations.
-5. `Gpt2::update` applies Adam updates using the configured learning rate and
-   momentum hyper-parameters.
-6. Optional: `main.rs` prints validation metrics or samples new text by repeatedly
-   calling `forward` with a growing prompt.
-
-## Model Architecture Overview
-
-* **Embeddings** – learned token (`wte`) and positional (`wpe`) tables of size
-  `vocab_size × channels` and `max_seq_len × channels`.
-* **Transformer blocks** (`num_layers` repetitions):
-  1. Pre-attention layer norm (`ln1w`, `ln1b`).
-  2. Linear projection into query/key/value (`qkvw`, `qkvb`).
-  3. Multi-head self-attention with causal masking (`num_heads`).
-  4. Linear projection back to the model dimension (`attprojw`, `attprojb`).
-  5. Residual addition.
-  6. Second layer norm (`ln2w`, `ln2b`).
-  7. Feed-forward MLP with hidden size `4 * channels` (`fcw`, `fcb`).
-  8. GELU activation (polynomial approximation).
-  9. Projection back to the model dimension (`fcprojw`, `fcprojb`).
-  10. Residual addition.
-* **Final layer norm** (`lnfw`, `lnfb`).
-* **LM head** – ties weights with `wte` to produce vocabulary logits.
-* **Loss** – cross-entropy over the shifted targets.
-
-## Data and Checkpoint Files
-
-* **Checkpoint (`gpt2_124M.bin`)** – binary file with a 256 `i32` header followed by
-  raw `f32` parameters. Mandatory for `Gpt2::build_from_checkpoint`.
-* **Token datasets (`*_train.bin`, `*_val.bin`)** – contiguous `i32` token IDs. The
-  program auto-discovers dataset pairs under `data/`.
-* **Tokenizer (`gpt2_tokenizer.bin`)** – not consumed by the Rust binary yet, but
-  useful if you want to decode generated tokens externally.
-
-## Building and Running
+## Happy-Path Container Execution
 
 ```bash
-# Fetch dependencies and compile in release mode
-cargo build --release
-
-# Run training/evaluation (expects checkpoints and data files to be in place)
-cargo run --release
+sudo target/release/mini-docker \
+  --rootfs "$ROOTFS" \
+  --hostname demo \
+  /bin/sh -lc "echo hello from $(hostname) && ls /"
 ```
 
-The executable prints available datasets, picks the first one, then starts a
-40-iteration training loop with batch size `B = 4` and sequence length `T = 64`.
+Expected outcomes:
 
-### Preparing data
+- Prompt prints `hello from demo` showing the UTS namespace works.
+- `/` listing shows BusyBox directories rather than the host root.
+- Exiting the shell should terminate the container cleanly with exit code `0`.
+
+Edge cases to probe immediately:
+
+- Launch with a missing command (`-- rootfs "$ROOTFS"`) to ensure the CLI rejects
+  it.
+- Point `--rootfs` at a non-directory path and confirm the binary errors with a
+  helpful message.
+
+## Resource Limit Validation
+
+### Memory Pressure Scenarios
+
+1. Run a stress test within a strict limit:
+
+   ```bash
+   sudo target/release/mini-docker \
+     --rootfs "$ROOTFS" \
+     --memory 32m \
+     /bin/sh -lc "echo $$ > /tmp/pid; stress-ng --vm 1 --vm-bytes 64m --timeout 20"
+   ```
+
+2. Observe behaviour:
+
+   - `stress-ng` should be terminated by the kernel (`dmesg | tail`) with an OOM
+     message referencing the container PID.
+   - The runtime should exit non-zero and print that the container exited with a
+     status reflecting the kill.
+
+3. Edge cases:
+
+   - Repeat with `--memory 0` (invalid) and ensure argument parsing rejects it.
+   - Try `--memory 4k` to confirm suffix handling.
+
+Mental model: treat the cgroup like a circuit breaker—push until it trips and
+verify the lights go out without burning the house down.
+
+### CPU Throttling Scenarios
+
+1. Launch a busy loop capped at 20% CPU:
+
+   ```bash
+   sudo target/release/mini-docker \
+     --rootfs "$ROOTFS" \
+     --cpu 20 \
+     /bin/sh -lc "yes > /dev/null"
+   ```
+
+2. In another terminal, inspect `cat /sys/fs/cgroup/mini-docker-*/cpu.stat` while
+   it runs; throttled time should increase.
+
+3. Confirm that removing the limit (no `--cpu`) allows full utilisation.
+
+4. Edge cases:
+
+   - Specify `--cpu 0` to verify parsing errors.
+   - Use `--cpu 100` with a multi-threaded load (e.g. `stress-ng --cpu 4`) to
+     ensure quota equals the full period.
+
+Mental model: imagine pouring sand through an hourglass—the quota constrains the
+flow, and you should see grains (CPU cycles) waiting.
+
+## Filesystem Isolation Checks
+
+1. From inside the container, create `/tmp/marker` and verify it does not appear
+   on the host outside the rootfs.
+2. Attempt to access a host-only path such as `/etc/hosts`; it should reference
+   the container's copy (or be absent) rather than the host file.
+3. Mount persistence check: restart the container and ensure `/tmp` is empty
+   because it is backed by a fresh tmpfs each run.
+4. Edge cases:
+
+   - Bind mount a host directory into the rootfs before launching and ensure the
+     runtime honours the pre-created mountpoint.
+   - Deliberately leave `/proc` missing to confirm the runtime creates it.
+
+## Networking Containment Checks
+
+1. Validate hostname isolation (`hostname` should show the configured value).
+2. By default, the network namespace has no configured interfaces. Inside the
+   container, run `ip link` to confirm only `lo` exists and is down.
+3. Edge cases:
+
+   - Attempt `ping 1.1.1.1` and expect failure due to missing network setup.
+   - If you add a veth pair manually, ensure the runtime still functions, proving
+     it does not assume specific interfaces.
+
+Mental model: visualize pulling the Ethernet cable—unless you wire networking
+back in, the container remains offline.
+
+## Failure Mode Drills
+
+Perform these to build confidence that error paths are graceful:
+
+- **Cgroup unavailable**: Temporarily remount a tmpfs over `/sys/fs/cgroup` (in a
+  test VM) and verify the runtime errors with `cgroup v2 is required`.
+- **Mount failure**: Make `/proc` inside the rootfs read-only and check that the
+  runtime surfaces the mount error.
+- **Child panic**: Run a non-existent binary; ensure the error prints the failing
+  `execvp` message.
+- **Signal propagation**: Send `SIGTERM` to the parent process and watch the
+  container terminate via `waitpid`.
+
+## Rust Unit Tests
+
+Automated tests focus on pure-Rust helpers that do not touch privileged
+interfaces:
 
 ```bash
-# Download weights and datasets (requires curl)
-./downloaddataset.sh
-
-# Move or link the desired token files into data/
-ln -s data/tinyshakespeare/tiny_shakespeare_train.bin data/tiny_shakespeare_train.bin
-ln -s data/tinyshakespeare/tiny_shakespeare_val.bin data/tiny_shakespeare_val.bin
+cargo test
 ```
 
-Ensure that the final directory contains files named `<dataset>_train.bin` and
-`<dataset>_val.bin`, otherwise `main.rs` will not discover them.
+The suite currently validates:
 
-### Runtime configuration
+- `parse_memory` handles decimal values, suffixes (`k`, `m`, `g`), and rejects
+  malformed input.
+- `parse_cpu_percent` enforces the `1..=100` range and surfaces friendly errors.
+- `unique_suffix` produces monotonically non-zero identifiers under normal clock
+  conditions.
 
-Key hyper-parameters currently live in `src/main.rs`:
+Extend the tests as you refactor: use the "invariant guardian" mental model—each
+unit test guards a property that should never regress.
 
-* `B` – batch size (default 4).
-* `T` – sequence length (default 64 tokens).
-* `val_num_batches` – number of validation batches per evaluation (default 10).
-* Training steps – fixed at 40 iterations for demonstration purposes.
+## Troubleshooting Checklist
 
-Modify the file or extend the binary with CLI arguments for more flexibility.
+When something misbehaves, walk this decision tree:
 
-## Extending the Project
+1. **Binary fails to start** → Rebuild with `cargo clean && cargo build` to rule
+   out stale artefacts.
+2. **Permission denied** → Confirm you are root and SELinux/AppArmor is not
+   blocking mounts (inspect `dmesg`).
+3. **cgroup errors** → Check that `systemd.unified_cgroup_hierarchy=1` is enabled
+   and no legacy controllers interfere.
+4. **Mount issues** → Ensure the rootfs directories exist and are writable before
+   launching.
+5. **Networking surprises** → If you expected connectivity, configure veth pairs
+   manually; the runtime intentionally leaves the namespace bare.
 
-* **Alternate activations or optimisers** – swap out the GELU polynomial or replace
-  Adam by adjusting `layers.rs` and `Gpt2::update`.
-* **Different checkpoints** – `build_from_checkpoint` reads dimensions from the
-  header, so any compatible binary with the same format should load. Adjust the
-  download script if needed.
-* **Token decoding** – integrate a tokenizer to turn sampled token IDs into human
-  readable text.
-* **Dataset selection** – add command-line parsing to choose among multiple dataset
-  pairs discovered under `data/`.
-* **Instrumentation** – the flat buffers make it easy to insert logging, gradient
-  checks or export functionality.
+## Further Exploration
 
-## Current Gaps & TODOs
+- Add CLI flags for bind mounts or environment variables.
+- Integrate seccomp filters to restrict syscalls.
+- Experiment with user namespaces to drop root inside the container.
+- Port the runtime to other languages for cross-paradigm comparison.
 
-* The download script nests datasets under `data/<name>/`; either adjust the script
-  or move files so that the auto-discovery logic can find them.
-* `main.rs` always selects the first dataset; command-line arguments or an
-  interactive prompt would make experimentation easier.
-* There is no tokenizer integration, so generated token IDs need to be decoded with
-  external tooling.
-* The AVX2 kernels target `x86_64`; other architectures fall back to the scalar
-  versions but may see reduced performance.
-* Parameter/activation buffers assume enough host memory for the configured
-  sequence length; add checks if you plan to scale up.
-
-## Further Reading
-
-* [GPT-2 paper (Radford et al., 2019)](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
-* [Andrej Karpathy – nanoGPT / llmc projects](https://github.com/karpathy/nanoGPT)
-* [The Illustrated Transformer](http://jalammar.github.io/illustrated-transformer/)
+This documentation should equip you to reason about the runtime like a systems
+engineer: hypothesise, test, observe, and iterate.
